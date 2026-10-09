@@ -1,0 +1,127 @@
+#!/bin/bash
+
+# Configure a position on RevertHook for Unichain
+# Usage: ./script/configure-position.sh
+# For protocol-managed routes, use ./script/configure-route.sh separately.
+
+set -e
+
+# ==================== Configuration ====================
+
+# Unichain RPC
+RPC_URL="https://mainnet.unichain.org"
+
+# RevertHook contract address (update after deployment)
+REVERT_HOOK="0xfcafc56b43a0956ba8fe8d94f3a787cb53121d43"
+
+# Position to configure
+TOKEN_ID="2461350"
+
+# ==================== Position Configuration ====================
+# PositionConfig struct:
+#   uint8 modeFlags;                    // bitwise PositionModeFlags; 1 = MODE_AUTO_COLLECT
+#   AutoCollectMode autoCollectMode;    // enum: 0=NONE, 1=AUTO_COLLECT, 2=HARVEST_TOKEN_0, 3=HARVEST_TOKEN_1, 4=HARVEST_TOKENS
+#   bool autoExitIsRelative;            // if true, auto exit ticks are relative to position limits
+#   bool autoExitSwapOnLowerTrigger;    // if true, lower-side AUTO_EXIT swaps into one token after debt repayment
+#   bool autoExitSwapOnUpperTrigger;    // if true, upper-side AUTO_EXIT swaps into one token after debt repayment
+#   int24 autoExitTickLower;            // lower tick for auto-exit trigger
+#   int24 autoExitTickUpper;            // upper tick for auto-exit trigger
+#   int24 autoRangeLowerLimit;          // lower limit for auto-range
+#   int24 autoRangeUpperLimit;          // upper limit for auto-range
+#   int24 autoRangeLowerDelta;          // delta below current tick for new range
+#   int24 autoRangeUpperDelta;          // delta above current tick for new range
+#   int24 autoLendToleranceTick;        // tolerance for auto-lend
+#   uint16 autoLeverageTargetBps;       // target leverage ratio in bps (0-10000)
+
+# Example: AUTO_COLLECT_ONLY mode
+MODE="1"                           # AUTO_COLLECT_ONLY
+AUTO_COLLECT_MODE="1"              # AUTO_COLLECT
+AUTO_EXIT_IS_RELATIVE="false"
+AUTO_EXIT_SWAP_ON_LOWER_TRIGGER="true"
+AUTO_EXIT_SWAP_ON_UPPER_TRIGGER="true"
+AUTO_EXIT_TICK_LOWER="-8388608"    # type(int24).min - disabled
+AUTO_EXIT_TICK_UPPER="8388607"     # type(int24).max - disabled
+AUTO_RANGE_LOWER_LIMIT="-8388608"  # type(int24).min - disabled
+AUTO_RANGE_UPPER_LIMIT="8388607"   # type(int24).max - disabled
+AUTO_RANGE_LOWER_DELTA="0"
+AUTO_RANGE_UPPER_DELTA="0"
+AUTO_LEND_TOLERANCE_TICK="0"
+AUTO_LEVERAGE_TARGET_BPS="0"
+
+# ==================== Swap Protection Configuration ====================
+# Swap routes are protocol-managed in HookRouteController and are no longer configured per position.
+# If you are the protocol admin and need to set a route, do that separately on HookRouteController.
+MAX_PRICE_IMPACT_BPS_0="100"       # 1% max slippage for token0->token1 swaps
+MAX_PRICE_IMPACT_BPS_1="100"       # 1% max slippage for token1->token0 swaps
+
+# ==================== Helper Functions ====================
+
+print_header() {
+    echo ""
+    echo "=============================================="
+    echo "$1"
+    echo "=============================================="
+}
+
+# ==================== Main Script ====================
+
+print_header "RevertHook Position Configuration"
+
+echo "RPC URL: $RPC_URL"
+echo "RevertHook: $REVERT_HOOK"
+echo "Token ID: $TOKEN_ID"
+echo ""
+
+# Check if PRIVATE_KEY is set
+if [ -z "$PRIVATE_KEY" ]; then
+    echo "Error: PRIVATE_KEY environment variable not set"
+    echo "Usage: PRIVATE_KEY=0x... ./script/configure-position.sh"
+    exit 1
+fi
+
+print_header "Step 1: Set Swap Protection Config"
+
+echo "Setting swap protection config for token $TOKEN_ID..."
+echo "  Max Price Impact (token0->token1): ${MAX_PRICE_IMPACT_BPS_0} bps"
+echo "  Max Price Impact (token1->token0): ${MAX_PRICE_IMPACT_BPS_1} bps"
+
+# setSwapProtectionConfig(uint256 tokenId, uint32 maxPriceImpactBps0, uint32 maxPriceImpactBps1)
+cast send "$REVERT_HOOK" \
+    "setSwapProtectionConfig(uint256,uint32,uint32)" \
+    "$TOKEN_ID" \
+    "$MAX_PRICE_IMPACT_BPS_0" \
+    "$MAX_PRICE_IMPACT_BPS_1" \
+    --rpc-url "$RPC_URL" \
+    --private-key "$PRIVATE_KEY"
+
+echo "Swap protection config set successfully!"
+
+print_header "Step 2: Set Position Config"
+
+echo "Setting position config for token $TOKEN_ID..."
+echo "  Mode: $MODE (1=AUTO_COLLECT_ONLY)"
+echo "  Auto Collect Mode: $AUTO_COLLECT_MODE (1=AUTO_COLLECT)"
+
+# setPositionConfig(uint256 tokenId, (uint8,uint8,bool,bool,bool,int24,int24,int24,int24,int24,int24,int24,uint16) positionConfig)
+# The struct is passed as a tuple
+cast send "$REVERT_HOOK" \
+    "setPositionConfig(uint256,(uint8,uint8,bool,bool,bool,int24,int24,int24,int24,int24,int24,int24,uint16))" \
+    "$TOKEN_ID" \
+    "($MODE,$AUTO_COLLECT_MODE,$AUTO_EXIT_IS_RELATIVE,$AUTO_EXIT_SWAP_ON_LOWER_TRIGGER,$AUTO_EXIT_SWAP_ON_UPPER_TRIGGER,$AUTO_EXIT_TICK_LOWER,$AUTO_EXIT_TICK_UPPER,$AUTO_RANGE_LOWER_LIMIT,$AUTO_RANGE_UPPER_LIMIT,$AUTO_RANGE_LOWER_DELTA,$AUTO_RANGE_UPPER_DELTA,$AUTO_LEND_TOLERANCE_TICK,$AUTO_LEVERAGE_TARGET_BPS)" \
+    --rpc-url "$RPC_URL" \
+    --private-key "$PRIVATE_KEY"
+
+echo "Position config set successfully!"
+
+print_header "Step 3: Verify Configuration"
+
+echo "Reading position config..."
+cast call "$REVERT_HOOK" \
+    "positionConfigs(uint256)" \
+    "$TOKEN_ID" \
+    --rpc-url "$RPC_URL"
+
+print_header "Configuration Complete!"
+
+echo "Position $TOKEN_ID is now configured for auto-collect on RevertHook"
+echo ""

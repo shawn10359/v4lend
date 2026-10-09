@@ -1,0 +1,1216 @@
+// SPDX-License-Identifier: BUSL-1.1
+pragma solidity ^0.8.30;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
+import {LPFeeLibrary} from "@uniswap/v4-core/src/libraries/LPFeeLibrary.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+
+import {HookExecutorRegistry} from "./HookExecutorRegistry.sol";
+import {IHookAuctionController} from "./interfaces/IHookAuctionController.sol";
+import {IRevertHookDynamicFee} from "./HookAuctionController.sol";
+
+/// @title HookLeaseController
+/// @notice Harberger-lease alternative to HookAuctionController: instead of fixed epochs won by
+///         English auction, ONE lessee holds the discounted-LP-fee executor slot continuously.
+///         The lessee self-assesses a price (escrowed as a deposit), pays rent on that price at
+///         a per-second tax rate, and anyone can take the slot at any time by outbidding the
+///         self-assessed price (the classic Harberger buyout). Rent - minus a protocol fee - is
+///         dripped to in-range LPs via PoolManager.donate().
+/// @dev Implements the same hook-facing IHookAuctionController interface as the epoch-auction
+///      controller, so a deployment chooses the mechanism by wiring ONE of the two as the hook's
+///      immutable auction controller. Design notes (shared with HookAuctionController):
+///      - All accounting uses block.timestamp (Arbitrum block.number tracks L1 blocks).
+///      - The lessee is recognized as the address that calls PoolManager.swap directly (its
+///        registered executor). Shared routers must never be registered as executors.
+///      - Refunds of bought-out lessees are escrowed (pull-based) so a reverting token transfer
+///        can never block a buyout.
+///      - Hook-facing entry points (beforeSwap / beforeLiquidityChange) are non-reverting by
+///        construction: they early-return for configured-but-idle pools, and the only
+///        externally-dependent step - donating to LPs in the config-chosen auction currency -
+///        is isolated inside this contract's own donate try/catch.
+///      - The auction currency must be an ERC20 side of the pool. Pools with a native
+///        currency0 are supported by leasing in the ERC20 currency1.
+contract HookLeaseController is HookExecutorRegistry, IHookAuctionController, IUnlockCallback, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    using PoolIdLibrary for PoolKey;
+
+    // ==================== Constants ====================
+
+    uint32 internal constant PPM = 1_000_000;
+    uint16 internal constant BPS_DENOMINATOR = 10_000;
+    uint16 internal constant MAX_PROTOCOL_FEE_BPS = 2_000;
+    uint32 internal constant MAX_DRIP_HORIZON_SECONDS = 30 days;
+    /// @notice Longest runway a lease's prepaid rent may cover (external audit V4LE-22/36). Bounds
+    ///         how long a disabled pool's running lease - and, through a public executor, its
+    ///         discount - can survive the owner's wind-down, and keeps paidThrough far from the
+    ///         uint40 saturation sentinel. A solvent lessee can top up any time while leasing is
+    ///         enabled, so the bound costs nothing in normal operation.
+    uint256 public constant MAX_PREPAID_RUNWAY_SECONDS = 365 days;
+    uint256 internal constant MAX_ESCROW_AMOUNT = uint256(uint128(type(int128).max));
+    uint256 internal constant Q64 = 1 << 64;
+
+    // Salt for the per-pool same-TRANSACTION memo slot (EIP-1153, cleared per transaction).
+    // Accrual and dripping are idempotent within a timestamp, so once a pool was accrued+dripped
+    // in this transaction, later touches skip straight to the discount check.
+    bytes32 internal constant _TX_MEMO_SALT = keccak256("HookLeaseController.txMemo");
+
+    // ==================== Structs ====================
+
+    /// @dev Field order is gas-deliberate: slot 0 carries everything the swap hot path needs
+    ///      (configured-gate, drip throttle horizon, discount fee), read as a single cold SLOAD.
+    struct PoolLeaseConfig {
+        // slot 0 - swap hot path
+        uint64 startTime; // unix seconds; leases and discounts start here
+        uint32 minDripSeconds; // drip throttle; nonzero doubles as the "configured" flag
+        uint32 dripHorizonSeconds; // pending rent drains to LPs over roughly this horizon (anti-JIT)
+        uint24 normalLpFee; // baseline LP fee, mirrored into the pool's stored dynamic fee
+        uint32 feeDiscountPpm; // lessee discount on normalLpFee; 1_000_000 = zero-fee lessee
+        bool leasingEnabled; // false = deactivated: no new lease/buyout/top-up, running lease honored
+        // slot 1 - lease-action time
+        Currency auctionCurrency; // ERC20 side of the pool used for deposits, rent and fees
+        uint32 minBuyoutBumpPpm; // relative price increment a buyout must offer
+        uint16 protocolFeeBps; // share of accrued rent sent to protocolFeeRecipient
+        uint32 minRentDepositSeconds; // nonrefundable minimum rent commitment at the entry price
+        // slot 2
+        address protocolFeeRecipient;
+        uint64 taxRatePerSecondX64; // rent per second as a Q64 fraction of the self-assessed price
+    }
+
+    /// @dev Slot 0 packs everything beforeSwap needs after the config gate: the discount check
+    ///      (executor + paidThrough) and both drip gates (lastDripTime throttle + hasPending)
+    ///      resolve from ONE cold SLOAD. executor and paidThrough are canonical here (not
+    ///      mirrors); hasPending mirrors pendingDonation != 0.
+    struct PoolLeaseState {
+        // slot 0 - swap hot path
+        address executor; // zero = no active lease
+        uint40 paidThrough; // rent covers [start, paidThrough); discount active STRICTLY while now < this
+        uint40 lastDripTime; // shared throttle clock for accrual + pending release
+        bool hasPending; // mirror of pendingDonation != 0
+        // slot 1 - accrual time
+        address lessee;
+        uint64 lastAccrualTime;
+        // sub-bps protocol-fee remainder (wei * bps units, < BPS_DENOMINATOR) carried across
+        // accruals so per-second rent slices cannot round the protocol fee to zero forever
+        uint16 feeCarry;
+        // slot 2 - accrual time
+        uint128 price; // self-assessed price, escrowed as the lease deposit
+        uint128 rentBalance; // prepaid rent not yet accrued
+        // Accrued rent that could not be delivered directly (zero-liquidity periods, failed
+        // donates, lease-action accruals); released gradually. uint256 so a long-lived lease
+        // can never overflow the accumulator.
+        uint256 pendingDonation;
+        // Release pace of the pending bucket: the largest "one horizon of rent" (gross rent per
+        // second times dripHorizonSeconds; an upper bound on the net-of-fee rent the bucket
+        // receives) among the accruals that fed it. Bounds every release to what the lease
+        // itself would have delivered over the same interval, so the slice a JIT position can
+        // capture does not grow with the length of the gap that filled the bucket.
+        // Read only when a release actually happens; reset to 0 whenever the bucket drains.
+        uint128 pendingReleasePerHorizon;
+        // Entry-price minimum rent still owed. Time-accrued rent pays it down; termination
+        // charges any remainder before refunding rentBalance. Always <= rentBalance.
+        uint128 minimumRentRemaining;
+    }
+
+    // ==================== State ====================
+
+    IPoolManager public immutable poolManager;
+
+    // Owner-managed executor denylist - same rationale as HookAuctionController: a lessee
+    // registering a shared router would give every trader routing through it the discount.
+    mapping(address executor => bool denied) public executorDenied;
+
+    mapping(PoolId poolId => PoolLeaseConfig config) internal _poolConfigs;
+    mapping(PoolId poolId => PoolLeaseState state) internal _poolStates;
+    mapping(Currency currency => mapping(address account => uint256 amount)) public refunds;
+    mapping(Currency currency => mapping(address account => uint256 amount)) public protocolFeesAccrued;
+
+    // ==================== Events ====================
+
+    event PoolLeaseConfigured(PoolId indexed poolId, PoolLeaseConfig config);
+    event LeasingEnabledSet(PoolId indexed poolId, bool enabled);
+    event LeaseStarted(
+        PoolId indexed poolId, address indexed lessee, address indexed executor, uint256 price, uint256 rentDeposit
+    );
+    event LeaseBought(
+        PoolId indexed poolId,
+        address indexed oldLessee,
+        address indexed newLessee,
+        address executor,
+        uint256 newPrice,
+        uint256 rentDeposit,
+        uint256 oldRefund
+    );
+    event LeasePriceChanged(PoolId indexed poolId, address indexed lessee, uint256 oldPrice, uint256 newPrice);
+    event LeaseRentFunded(PoolId indexed poolId, address indexed lessee, uint256 amount);
+    event LeaseExited(PoolId indexed poolId, address indexed lessee, uint256 refund);
+    event LeaseEvicted(PoolId indexed poolId, address indexed lessee, uint256 refund);
+    event RentAccrued(PoolId indexed poolId, uint256 amount, uint256 protocolFee, uint256 remainingRentBalance);
+    event RentDripped(PoolId indexed poolId, uint256 amount);
+    event PendingDonationDripped(PoolId indexed poolId, uint256 amount, uint256 pendingRemaining);
+    event RefundEscrowed(PoolId indexed poolId, Currency indexed currency, address indexed account, uint256 amount);
+    event RefundClaimed(Currency indexed currency, address indexed account, address recipient, uint256 amount);
+    event ProtocolFeesClaimed(Currency indexed currency, address indexed account, address recipient, uint256 amount);
+    event NormalLpFeeSet(PoolId indexed poolId, uint24 normalLpFee);
+    event PendingDonationSwept(PoolId indexed poolId, Currency indexed currency, address recipient, uint256 amount);
+    event DonateFailed(PoolId indexed poolId, uint256 amount);
+    event ExecutorDeniedSet(address indexed executor, bool denied);
+
+    // ==================== Errors ====================
+
+    error InvalidConfig();
+    error PoolNotConfigured();
+    error PoolStateNotClean();
+    error LeasingDisabled();
+    error LeasingNotStarted();
+    error LeaseAlreadyActive();
+    error NoActiveLease();
+    error NotLessee();
+    error LeaseStillSolvent();
+    error InvalidPrice();
+    error InvalidRentDeposit();
+    error InvalidExecutor();
+    error ExactTransferFailed();
+    error NothingToClaim();
+    error OnlyPoolManager();
+    error PrepaidRunwayTooLong();
+
+    constructor(address hook_, IPoolManager poolManager_) HookExecutorRegistry(hook_) {
+        if (address(poolManager_) == address(0)) {
+            revert InvalidConfig();
+        }
+        poolManager = poolManager_;
+    }
+
+    modifier onlyHook() {
+        _checkHook();
+        _;
+    }
+
+    function _checkHook() internal view {
+        if (msg.sender != hook) {
+            revert Unauthorized();
+        }
+    }
+
+    // ==================== Hook-facing entry points ====================
+
+    /// @inheritdoc IHookAuctionController
+    /// @dev Non-reverting by construction (the hook calls it directly): early-returns for idle
+    ///      pools, and the donate leg is isolated in _donate's own try/catch. Runs inside the
+    ///      hook's beforeSwap, i.e. while the PoolManager is unlocked, so donations settle directly.
+    ///      Integration note: that settlement re-syncs the PoolManager's single synced-currency
+    ///      slot inside the caller's unlock - see donateExternal (AUDIT-ACCEPTED-CONTROLLER-DRIP-SYNC).
+    function beforeSwap(PoolKey calldata key, address sender) external onlyHook returns (uint24 lpFeeOverride) {
+        PoolId poolId = key.toId();
+        // single cold SLOAD to skip the many pools that never run a lease
+        if (_poolConfigs[poolId].minDripSeconds == 0 || block.timestamp < _poolConfigs[poolId].startTime) {
+            return 0;
+        }
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        PoolLeaseState storage state = _poolStates[poolId];
+
+        // The delivered obligation (the lessee's fee override) is decided from state slot 0
+        // alone, BEFORE the best-effort drip: it must survive a drip/token failure - the lessee
+        // paid rent for it. now < paidThrough encodes rent solvency without any math; the
+        // comparison is STRICT so a deposit covering k seconds grants exactly [start, start+k) -
+        // a zero-duration top-up (sub-second dust that floors to paidThrough == now) activates
+        // nothing, otherwise 1 wei per block would rent the slot. The denylist is re-read on the
+        // executor's own swaps only (short-circuit): admission binds address + code hash, which
+        // cannot bind a proxy's implementation, so a denial is the live cut-off for an executor
+        // that changed behaviour mid-lease (V4LE-105).
+        if (
+            state.executor != address(0) && sender == state.executor && block.timestamp < state.paidThrough
+                && !executorDenied[sender]
+        ) {
+            lpFeeOverride = _discountedLpFee(config) | LPFeeLibrary.OVERRIDE_FEE_FLAG;
+        }
+
+        // same-transaction memo: accrual + drip are idempotent per timestamp
+        bytes32 memoSlot = PoolId.unwrap(poolId) ^ _TX_MEMO_SALT;
+        bool memoHit;
+        assembly ("memory-safe") {
+            memoHit := eq(tload(memoSlot), timestamp())
+        }
+        if (memoHit) {
+            return lpFeeOverride;
+        }
+
+        _accrueAndDrip(key, poolId, config, state);
+        assembly ("memory-safe") {
+            tstore(memoSlot, timestamp())
+        }
+    }
+
+    /// @inheritdoc IHookAuctionController
+    /// @dev Same integration note as beforeSwap: the drip may sync/settle inside the caller's
+    ///      unlock (AUDIT-ACCEPTED-CONTROLLER-DRIP-SYNC, see donateExternal).
+    function beforeLiquidityChange(PoolKey calldata key) external onlyHook {
+        PoolId poolId = key.toId();
+        if (_poolConfigs[poolId].minDripSeconds == 0 || block.timestamp < _poolConfigs[poolId].startTime) {
+            return;
+        }
+        bytes32 memoSlot = PoolId.unwrap(poolId) ^ _TX_MEMO_SALT;
+        bool memoHit;
+        assembly ("memory-safe") {
+            memoHit := eq(tload(memoSlot), timestamp())
+        }
+        if (memoHit) {
+            return; // already accrued + dripped at this timestamp in this transaction
+        }
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        _accrueAndDrip(key, poolId, config, _poolStates[poolId]);
+        assembly ("memory-safe") {
+            tstore(memoSlot, timestamp())
+        }
+    }
+
+    // ==================== Lease actions ====================
+
+    /// @notice Starts a lease on a vacant pool: escrows the self-assessed `price` as a deposit
+    ///         and prepays `rentDeposit` of rent. The registered executor gets the fee discount
+    ///         while the rent balance covers the current time.
+    ///         At least entry rent-per-second * minRentDepositSeconds is nonrefundable, even
+    ///         when the lease exits or is bought out in the same transaction.
+    /// @dev A rent-INSOLVENT incumbent (now >= paidThrough: no discount, no rent accruing) does not
+    ///      count as active: it is evicted first (final accrual delivered, deposit and rent dust
+    ///      escrowed for pull-refund, see evictLease) and the caller enters at their own price - no
+    ///      buyout bump, since a lapsed lease has no claim on the slot. A solvent lease can only be
+    ///      taken via buyout.
+    function startLease(PoolKey calldata key, address executor, uint256 price, uint256 rentDeposit)
+        external
+        nonReentrant
+    {
+        PoolId poolId = key.toId();
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        _checkLeaseActionAllowed(config);
+        _checkExecutor(executor);
+
+        PoolLeaseState storage state = _poolStates[poolId];
+        address incumbent = state.lessee;
+        if (incumbent != address(0)) {
+            if (block.timestamp < state.paidThrough) {
+                revert LeaseAlreadyActive();
+            }
+            _evictInsolvent(key, poolId, config, state, incumbent);
+        }
+        _installLease(config, state, executor, price, rentDeposit);
+        emit LeaseStarted(poolId, msg.sender, executor, price, rentDeposit);
+    }
+
+    /// @notice Takes over an active lease Harberger-style: pay a price at least minBuyoutBumpPpm
+    ///         above the current self-assessed price (escrowed as the new deposit) plus a fresh
+    ///         rent deposit. The old lessee's deposit and rent left after settling their
+    ///         minimum commitment go to pull-refund escrow.
+    function buyout(PoolKey calldata key, address executor, uint256 newPrice, uint256 rentDeposit)
+        external
+        nonReentrant
+    {
+        PoolId poolId = key.toId();
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        _checkLeaseActionAllowed(config);
+        _checkExecutor(executor);
+
+        PoolLeaseState storage state = _poolStates[poolId];
+        address oldLessee = state.lessee;
+        if (oldLessee == address(0)) {
+            revert NoActiveLease();
+        }
+        _settleAccrualForLeaseAction(key, poolId, config, state);
+
+        if (newPrice < minBuyoutPrice(poolId)) {
+            revert InvalidPrice();
+        }
+
+        _settleMinimumRent(poolId, config, state);
+        uint256 oldRefund = uint256(state.price) + state.rentBalance;
+        _installLease(config, state, executor, newPrice, rentDeposit);
+        if (oldRefund != 0) {
+            refunds[config.auctionCurrency][oldLessee] += oldRefund;
+            emit RefundEscrowed(poolId, config.auctionCurrency, oldLessee, oldRefund);
+        }
+        emit LeaseBought(poolId, oldLessee, msg.sender, executor, newPrice, rentDeposit, oldRefund);
+    }
+
+    /// @dev Shared start/buyout tail: validates price and deposit, pulls the funds exactly and
+    ///      writes the new lease (including the slot-0 hot-path fields).
+    function _installLease(
+        PoolLeaseConfig storage config,
+        PoolLeaseState storage state,
+        address executor,
+        uint256 price,
+        uint256 rentDeposit
+    ) internal {
+        _checkPrice(price);
+        uint256 rps = _rentPerSecond(config, price);
+        uint256 minimumRent = rps * config.minRentDepositSeconds;
+        if (rentDeposit < minimumRent || rentDeposit > MAX_ESCROW_AMOUNT) {
+            revert InvalidRentDeposit();
+        }
+        _checkPrepaidRunway(rentDeposit, rps);
+
+        state.lessee = msg.sender;
+        state.lastAccrualTime = uint64(block.timestamp);
+        state.price = uint128(price);
+        state.rentBalance = uint128(rentDeposit);
+        state.minimumRentRemaining = uint128(minimumRent); // bounded by rentDeposit above
+        state.executor = executor;
+        state.paidThrough = _paidThrough(block.timestamp, rentDeposit, rps);
+
+        _pullExact(config.auctionCurrency, price + rentDeposit);
+    }
+
+    /// @notice Tops up the prepaid rent of the caller's lease.
+    function fundRent(PoolKey calldata key, uint256 amount) external nonReentrant {
+        PoolId poolId = key.toId();
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        _checkLeaseActionAllowed(config);
+        PoolLeaseState storage state = _requireLessee(poolId);
+        if (amount == 0 || uint256(state.rentBalance) + amount > MAX_ESCROW_AMOUNT) {
+            revert InvalidRentDeposit();
+        }
+
+        _settleAccrualForLeaseAction(key, poolId, config, state);
+        state.rentBalance += uint128(amount);
+        uint256 rps = _rentPerSecond(config, state.price);
+        _checkPrepaidRunway(state.rentBalance, rps);
+        state.paidThrough = _paidThrough(state.lastAccrualTime, state.rentBalance, rps);
+        _pullExact(config.auctionCurrency, amount);
+        emit LeaseRentFunded(poolId, msg.sender, amount);
+    }
+
+    /// @notice Changes the caller's self-assessed price. Raising it pulls the difference into
+    ///         escrow (and raises the rent); lowering it refunds the difference (and lowers the
+    ///         rent, but also the buyout threshold - the Harberger honesty incentive).
+    ///         The unpaid entry-price minimum rent commitment does not change.
+    /// @dev Raising requires leasing to be enabled. Lowering stays allowed while leasing is
+    ///      disabled only as long as it does not stretch the prepaid runway: a lower rent rate
+    ///      would otherwise revive a run-out lease from its remaining balance and block the
+    ///      owner's wind-down, since evictLease requires insolvency. (While leasing is enabled a
+    ///      lapsed lessee may revive this way - it is a race against eviction / startLease, and
+    ///      the deposit is theirs either way.)
+    function setPrice(PoolKey calldata key, uint256 newPrice) external nonReentrant {
+        PoolId poolId = key.toId();
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        if (!_isRunning(config)) {
+            revert PoolNotConfigured();
+        }
+        PoolLeaseState storage state = _requireLessee(poolId);
+        uint256 oldPrice = state.price;
+        if (newPrice == oldPrice) {
+            revert InvalidPrice();
+        }
+        _checkPrice(newPrice);
+
+        _settleAccrualForLeaseAction(key, poolId, config, state);
+        uint256 newRps = _rentPerSecond(config, newPrice);
+        uint40 newPaidThrough = _paidThrough(state.lastAccrualTime, state.rentBalance, newRps);
+        if (!config.leasingEnabled && (newPrice > oldPrice || newPaidThrough > state.paidThrough)) {
+            revert LeasingDisabled();
+        }
+        // a lower price lowers the rent, stretching the remaining balance over a longer runway
+        _checkPrepaidRunway(state.rentBalance, newRps);
+        state.price = uint128(newPrice);
+        state.paidThrough = newPaidThrough;
+
+        if (newPrice > oldPrice) {
+            _pullExact(config.auctionCurrency, newPrice - oldPrice);
+        } else {
+            _transferOutExact(config.auctionCurrency, msg.sender, oldPrice - newPrice);
+        }
+        emit LeasePriceChanged(poolId, msg.sender, oldPrice, newPrice);
+    }
+
+    /// @notice Ends the caller's lease and returns the price deposit plus rent left after
+    ///         settling the minimum rent commitment. Elapsed rent counts toward the minimum.
+    ///         Always allowed, including while leasing is disabled.
+    function exitLease(PoolKey calldata key) external nonReentrant returns (uint256 refund) {
+        PoolId poolId = key.toId();
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        PoolLeaseState storage state = _requireLessee(poolId);
+
+        // a lease can only exist once startTime has passed, so accrual is always safe here
+        _settleAccrualForLeaseAction(key, poolId, config, state);
+        _settleMinimumRent(poolId, config, state);
+        refund = uint256(state.price) + state.rentBalance;
+        _clearLease(state);
+        if (refund != 0) {
+            _transferOutExact(config.auctionCurrency, msg.sender, refund);
+        }
+        emit LeaseExited(poolId, msg.sender, refund);
+    }
+
+    /// @notice Drips any accrued rent of a pool to its in-range LPs.
+    /// @dev Also runs lazily on every swap and liquidity change of the pool.
+    function drip(PoolKey calldata key) external nonReentrant returns (uint256 amountDonated) {
+        bytes memory result = poolManager.unlock(abi.encode(key));
+        amountDonated = abi.decode(result, (uint256));
+    }
+
+    /// @dev Unlock callback for drip().
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        if (msg.sender != address(poolManager)) {
+            revert OnlyPoolManager();
+        }
+        PoolKey memory key = abi.decode(data, (PoolKey));
+        PoolId poolId = key.toId();
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        if (!_isRunning(config)) {
+            return abi.encode(uint256(0));
+        }
+        uint256 amountDonated = _accrueAndDrip(key, poolId, config, _poolStates[poolId]);
+        return abi.encode(amountDonated);
+    }
+
+    // ==================== Claims ====================
+
+    /// @notice Claims escrowed refunds of bought-out or evicted leases.
+    /// @dev Recipient-side transfer fees are deliberately NOT checked (the claimant bears the
+    ///      token's own fee; claims are voluntary and deferrable), while the CONTROLLER's debit
+    ///      must be exact - same policy as HookAuctionController.
+    function claimRefund(Currency currency, address recipient) external nonReentrant returns (uint256 amount) {
+        amount = refunds[currency][msg.sender];
+        if (amount == 0) {
+            revert NothingToClaim();
+        }
+        refunds[currency][msg.sender] = 0;
+        _transferOutExact(currency, recipient, amount);
+        emit RefundClaimed(currency, msg.sender, recipient, amount);
+    }
+
+    /// @notice Claims accrued protocol fees. Callable by the configured recipient account.
+    function claimProtocolFees(Currency currency, address recipient) external nonReentrant returns (uint256 amount) {
+        amount = protocolFeesAccrued[currency][msg.sender];
+        if (amount == 0) {
+            revert NothingToClaim();
+        }
+        protocolFeesAccrued[currency][msg.sender] = 0;
+        _transferOutExact(currency, recipient, amount);
+        emit ProtocolFeesClaimed(currency, msg.sender, recipient, amount);
+    }
+
+    // ==================== Owner configuration ====================
+
+    /// @notice Configures (or reconfigures) the lease for a pool. The pool must be initialized,
+    ///         use the dynamic fee flag and this controller's hook.
+    /// @dev Reconfiguration requires a clean state: no active lease and no undistributed
+    ///      donations. Use setLeasingEnabled(false) first to wind down (and evictLease - open to
+    ///      anyone - once the running lease is rent-insolvent, if the lessee never exits).
+    function configurePool(PoolKey calldata key, PoolLeaseConfig memory config) external {
+        _checkOwner();
+
+        PoolId poolId = key.toId();
+        if (address(key.hooks) != hook || key.fee != LPFeeLibrary.DYNAMIC_FEE_FLAG) {
+            revert InvalidConfig();
+        }
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(poolManager, poolId);
+        if (sqrtPriceX96 == 0) {
+            revert InvalidConfig();
+        }
+        if (
+            config.auctionCurrency.isAddressZero()
+                || (!(config.auctionCurrency == key.currency0) && !(config.auctionCurrency == key.currency1))
+        ) {
+            revert InvalidConfig();
+        }
+        if (
+            config.normalLpFee > LPFeeLibrary.MAX_LP_FEE || config.feeDiscountPpm > PPM
+                || config.protocolFeeBps > MAX_PROTOCOL_FEE_BPS || config.protocolFeeRecipient == address(0)
+                // fees credit protocolFeesAccrued[currency][recipient] and are pulled by the recipient
+                // via claimProtocolFees; the controller can never call that as itself, so crediting
+                // its own address would strand every protocol fee of the pool. The same holds for
+                // the other immutables of this system, hook and PoolManager; any other recipient is
+                // the owner's responsibility (a contract must be able to call claimProtocolFees)
+                || config.protocolFeeRecipient == address(this) || config.protocolFeeRecipient == hook
+                || config.protocolFeeRecipient == address(poolManager)
+        ) {
+            revert InvalidConfig();
+        }
+        if (
+            config.minDripSeconds == 0 || config.dripHorizonSeconds < config.minDripSeconds
+                || config.dripHorizonSeconds > MAX_DRIP_HORIZON_SECONDS || config.minBuyoutBumpPpm == 0
+                || config.minBuyoutBumpPpm > PPM || config.minRentDepositSeconds == 0
+                || config.minRentDepositSeconds > MAX_PREPAID_RUNWAY_SECONDS || config.taxRatePerSecondX64 == 0
+        ) {
+            revert InvalidConfig();
+        }
+        // The mandatory rent deposit must be escrowable at EVERY installable price (rps is
+        // monotonic in price, so checking the cap covers all): otherwise an incumbent could
+        // raise their price to one whose buyout deposit exceeds MAX_ESCROW_AMOUNT, making the
+        // slot un-buyoutable. Economically this bounds the mandatory prepay to at most ~100%
+        // of the self-assessed price - any config demanding more is nonsensical anyway.
+        if (
+            FullMath.mulDivRoundingUp(MAX_ESCROW_AMOUNT, config.taxRatePerSecondX64, Q64) * config.minRentDepositSeconds
+                > MAX_ESCROW_AMOUNT
+        ) {
+            revert InvalidConfig();
+        }
+        if (config.startTime == 0) {
+            config.startTime = uint64(block.timestamp);
+        }
+        if (config.startTime < block.timestamp) {
+            revert InvalidConfig();
+        }
+
+        PoolLeaseState storage state = _poolStates[poolId];
+        if (state.lessee != address(0) || state.pendingDonation != 0) {
+            revert PoolStateNotClean();
+        }
+        delete _poolStates[poolId];
+
+        _poolConfigs[poolId] = config;
+
+        // mirror the baseline fee into the pool's stored dynamic fee so all non-lessee swaps use it
+        IRevertHookDynamicFee(hook).updateDynamicLPFee(key, config.normalLpFee);
+
+        emit PoolLeaseConfigured(poolId, config);
+    }
+
+    /// @notice Enables or disables leasing for a pool. Disabling stops new leases, buyouts,
+    ///         rent top-ups and price raises immediately; the running lease is honored until
+    ///         its prepaid rent runs out (or the lessee exits) and accrued rent keeps dripping.
+    ///         The prepaid runway is bounded by MAX_PREPAID_RUNWAY_SECONDS and cannot be extended
+    ///         while disabled, so the lease ends - and evictLease opens to anyone - within that
+    ///         bound at the latest.
+    function setLeasingEnabled(PoolKey calldata key, bool enabled) external {
+        _checkOwner();
+        PoolId poolId = key.toId();
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        config.leasingEnabled = enabled;
+        emit LeasingEnabledSet(poolId, enabled);
+    }
+
+    /// @notice Denies (or re-allows) an executor. A denied executor can never be registered via
+    ///         startLease/buyout, and a running lease's executor loses its fee override at once
+    ///         while denied (rent keeps accruing; the lessee exits or re-registers another
+    ///         executor). Use it to block known shared routers, and to cut off an admitted
+    ///         executor whose code changed behind its code hash (e.g. an upgraded proxy, see
+    ///         HookExecutorRegistry).
+    function setExecutorDenied(address executor, bool denied) external {
+        _checkOwner();
+        executorDenied[executor] = denied;
+        emit ExecutorDeniedSet(executor, denied);
+    }
+
+    /// @notice Updates the baseline LP fee of a configured pool and re-mirrors it into the
+    ///         pool's stored dynamic fee.
+    /// @dev Frozen while a lease is active: the lessee priced their rent against the current
+    ///      baseline and discount - moving normalLpFee mid-lease would erode or invert the
+    ///      advantage they are paying for.
+    function setNormalLpFee(PoolKey calldata key, uint24 newNormalLpFee) external {
+        _checkOwner();
+        if (newNormalLpFee > LPFeeLibrary.MAX_LP_FEE) {
+            revert InvalidConfig();
+        }
+        PoolId poolId = key.toId();
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        if (_poolStates[poolId].lessee != address(0)) {
+            revert LeaseAlreadyActive();
+        }
+        config.normalLpFee = newNormalLpFee;
+        IRevertHookDynamicFee(hook).updateDynamicLPFee(key, newNormalLpFee);
+        emit NormalLpFeeSet(poolId, newNormalLpFee);
+    }
+
+    /// @notice Frees the slot of a lease whose prepaid rent has run out (now >= paidThrough) but
+    ///         whose lessee never exits: refunds the price deposit (plus any rent dust) to the
+    ///         lessee's pull-refund escrow. Permissionless and independent of leasingEnabled: an
+    ///         insolvent lessee gets no discount and pays no rent, so eviction takes nothing from
+    ///         them, while leaving them in place would let them squat the slot at zero carrying
+    ///         cost (blocking startLease and forcing entrants through a buyout at price + bump, or
+    ///         forcing the owner to freeze the pool's market to remove them). An actively paying
+    ///         lessee can never be evicted; a lapsed one can re-enter via startLease. Doubles as
+    ///         the owner's wind-down step once leasing is disabled.
+    function evictLease(PoolKey calldata key) external nonReentrant returns (uint256 refund) {
+        PoolId poolId = key.toId();
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        PoolLeaseState storage state = _poolStates[poolId];
+        address lessee = state.lessee;
+        if (lessee == address(0)) {
+            revert NoActiveLease();
+        }
+        // same strict boundary as the discount: at paidThrough the lease no longer covers rent.
+        // paidThrough is invariant under accrual, so checking it before the settlement is exact
+        if (block.timestamp < state.paidThrough) {
+            revert LeaseStillSolvent();
+        }
+        refund = _evictInsolvent(key, poolId, config, state, lessee);
+    }
+
+    /// @dev Shared eviction tail of evictLease and startLease-over-an-insolvent-incumbent; callers
+    ///      have verified `lessee` is the current lessee and now >= paidThrough. The final accrual
+    ///      is delivered to the LPs who were in range while it accrued, exactly like every other
+    ///      lease action (parked only inside a throttle window); the deposit plus the sub-second
+    ///      rent remainder go to the lessee's pull-refund escrow and the slot is cleared.
+    function _evictInsolvent(
+        PoolKey calldata key,
+        PoolId poolId,
+        PoolLeaseConfig storage config,
+        PoolLeaseState storage state,
+        address lessee
+    ) internal returns (uint256 refund) {
+        _settleAccrualForLeaseAction(key, poolId, config, state);
+        // A price raise can make the lease insolvent before its minimum has been earned.
+        _settleMinimumRent(poolId, config, state);
+        refund = uint256(state.price) + state.rentBalance;
+        _clearLease(state);
+        if (refund != 0) {
+            refunds[config.auctionCurrency][lessee] += refund;
+            emit RefundEscrowed(poolId, config.auctionCurrency, lessee, refund);
+        }
+        emit LeaseEvicted(poolId, lessee, refund);
+    }
+
+    /// @notice Owner rescue for pending-donation value that can no longer be delivered (e.g. a
+    ///         zero-liquidity pool or a broken auction currency). Credits the refund escrow of
+    ///         `recipient` instead of transferring - same policy as HookAuctionController. Only
+    ///         once leasing is wound down and no lease is active, so it cannot pre-empt normal
+    ///         dripping to LPs.
+    function sweepPendingDonation(PoolKey calldata key, address recipient)
+        external
+        nonReentrant
+        returns (uint256 amount)
+    {
+        _checkOwner();
+        if (recipient == address(0)) {
+            revert InvalidConfig();
+        }
+        PoolId poolId = key.toId();
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        if (config.leasingEnabled) {
+            revert LeasingDisabled();
+        }
+        PoolLeaseState storage state = _poolStates[poolId];
+        if (state.lessee != address(0)) {
+            revert LeaseAlreadyActive();
+        }
+
+        amount = state.pendingDonation;
+        if (amount == 0) {
+            revert NothingToClaim();
+        }
+        state.pendingDonation = 0;
+        state.hasPending = false;
+        state.pendingReleasePerHorizon = 0;
+        refunds[config.auctionCurrency][recipient] += amount;
+        emit PendingDonationSwept(poolId, config.auctionCurrency, recipient, amount);
+    }
+
+    // ==================== Views ====================
+
+    function getPoolLeaseConfig(PoolId poolId) external view returns (PoolLeaseConfig memory) {
+        return _poolConfigs[poolId];
+    }
+
+    /// @notice Nonrefundable commitment included in the stored rent balance, before any
+    ///         unaccrued elapsed rent is applied. Price changes cannot reduce this commitment.
+    function minimumRentRemaining(PoolId poolId) external view returns (uint256) {
+        return _poolStates[poolId].minimumRentRemaining;
+    }
+
+    function getPoolLeaseState(PoolId poolId)
+        external
+        view
+        returns (
+            address lessee,
+            address executor,
+            uint256 price,
+            uint256 rentBalance,
+            uint64 lastAccrualTime,
+            uint40 paidThrough,
+            uint256 pendingDonation
+        )
+    {
+        PoolLeaseState storage state = _poolStates[poolId];
+        return (
+            state.lessee,
+            state.executor,
+            state.price,
+            state.rentBalance,
+            state.lastAccrualTime,
+            state.paidThrough,
+            state.pendingDonation
+        );
+    }
+
+    /// @notice Release pace of the pool's pending-donation bucket (see PoolLeaseState).
+    function getPendingReleasePerHorizon(PoolId poolId) external view returns (uint128) {
+        return _poolStates[poolId].pendingReleasePerHorizon;
+    }
+
+    /// @notice Whether a pool has a lease configuration (independent of any activity).
+    function isConfigured(PoolId poolId) external view returns (bool) {
+        return _isConfigured(_poolConfigs[poolId]);
+    }
+
+    /// @notice The slot-0 hot-path fields (see PoolLeaseState). Exposed so the invariant suite
+    ///         and off-chain monitoring can verify them against the rest of the state.
+    function getHotPathState(PoolId poolId)
+        external
+        view
+        returns (address executor, uint40 paidThrough, uint40 lastDripTime, bool hasPending)
+    {
+        PoolLeaseState storage state = _poolStates[poolId];
+        return (state.executor, state.paidThrough, state.lastDripTime, state.hasPending);
+    }
+
+    /// @notice The lessee whose executor receives the fee discount RIGHT NOW (rent-solvency
+    ///         aware), matching what beforeSwap applies.
+    function getActiveLessee(PoolId poolId)
+        external
+        view
+        returns (address lessee, address executor, uint256 price, uint24 lpFee)
+    {
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        PoolLeaseState storage state = _poolStates[poolId];
+        if (!_isRunning(config) || state.executor == address(0) || block.timestamp >= state.paidThrough) {
+            return (address(0), address(0), 0, 0);
+        }
+        return (state.lessee, state.executor, state.price, _discountedLpFee(config));
+    }
+
+    /// @notice Minimum accepted buyout price for a pool's active lease.
+    function minBuyoutPrice(PoolId poolId) public view returns (uint256) {
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        PoolLeaseState storage state = _poolStates[poolId];
+        if (state.lessee == address(0)) {
+            revert NoActiveLease();
+        }
+        // saturate at the escrow cap: an incumbent at (or bumped past) the cap is contestable
+        // at the cap itself - equal price - so no price makes the slot un-buyoutable
+        uint256 required = uint256(state.price) + _buyoutBump(config, state.price);
+        return required > MAX_ESCROW_AMOUNT ? MAX_ESCROW_AMOUNT : required;
+    }
+
+    /// @notice Current rent per second of a pool's active lease.
+    function rentPerSecond(PoolId poolId) external view returns (uint256) {
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        return _rentPerSecond(config, _poolStates[poolId].price);
+    }
+
+    /// @notice The LP fee the lessee's executor pays on this pool.
+    function discountedLpFee(PoolId poolId) external view returns (uint24) {
+        PoolLeaseConfig storage config = _poolConfigs[poolId];
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        return _discountedLpFee(config);
+    }
+
+    // ==================== Internal: lease machine ====================
+
+    function _isConfigured(PoolLeaseConfig storage config) internal view returns (bool) {
+        return config.minDripSeconds != 0;
+    }
+
+    function _isRunning(PoolLeaseConfig storage config) internal view returns (bool) {
+        return _isConfigured(config) && block.timestamp >= config.startTime;
+    }
+
+    function _checkLeaseActionAllowed(PoolLeaseConfig storage config) internal view {
+        if (!_isConfigured(config)) {
+            revert PoolNotConfigured();
+        }
+        if (!config.leasingEnabled) {
+            revert LeasingDisabled();
+        }
+        if (block.timestamp < config.startTime) {
+            revert LeasingNotStarted();
+        }
+    }
+
+    function _checkExecutor(address executor) internal view {
+        if (
+            executor == address(0) || executor == address(poolManager) || executor == address(this) || executor == hook
+                || executorDenied[executor] || !_executorAdmitted(executor)
+        ) {
+            revert InvalidExecutor();
+        }
+    }
+
+    function _requireLessee(PoolId poolId) internal view returns (PoolLeaseState storage state) {
+        state = _poolStates[poolId];
+        if (state.lessee != msg.sender) {
+            revert NotLessee();
+        }
+    }
+
+    function _discountedLpFee(PoolLeaseConfig storage config) internal view returns (uint24) {
+        return uint24(uint256(config.normalLpFee) - uint256(config.normalLpFee) * config.feeDiscountPpm / PPM);
+    }
+
+    /// @dev Self-assessed prices are capped at MAX_ESCROW_AMOUNT; minBuyoutPrice saturates at
+    ///      the same cap (a bump-headroom requirement here would only move the un-buyoutable
+    ///      price one level down - any finite cap has a top), so the top price stays contestable.
+    function _checkPrice(uint256 price) internal pure {
+        if (price == 0 || price > MAX_ESCROW_AMOUNT) {
+            revert InvalidPrice();
+        }
+    }
+
+    function _buyoutBump(PoolLeaseConfig storage config, uint256 price) internal view returns (uint256) {
+        uint256 bump = price * config.minBuyoutBumpPpm / PPM;
+        return bump > 0 ? bump : 1;
+    }
+
+    /// @dev Rent per second, rounded UP so a nonzero price always burns rent (paidThrough stays
+    ///      finite) and the lessee can never hold the slot for free.
+    function _rentPerSecond(PoolLeaseConfig storage config, uint256 price) internal view returns (uint256) {
+        return FullMath.mulDivRoundingUp(price, config.taxRatePerSecondX64, Q64);
+    }
+
+    /// @dev Bounds the prepaid runway to MAX_PREPAID_RUNWAY_SECONDS (external audit V4LE-22/36).
+    ///      paidThrough is the lease's solvency boundary: the discount is served and eviction is
+    ///      refused strictly while now < paidThrough, and configurePool needs the slot vacant. Left
+    ///      unbounded, a lessee at the minimum price (1 raw unit; rent rounds UP to 1 raw unit per
+    ///      second) could prepay ~uint40.max seconds for ~1e-6 tokens and saturate paidThrough at
+    ///      the uint40 sentinel, keeping the discount - through a public executor, for anyone -
+    ///      past any wind-down and blocking reconfiguration forever. Checked wherever the runway
+    ///      can grow: install, top-up and price cuts (a lower rent stretches the balance).
+    function _checkPrepaidRunway(uint256 rentBalance, uint256 rps) internal pure {
+        if (rentBalance / rps > MAX_PREPAID_RUNWAY_SECONDS) {
+            revert PrepaidRunwayTooLong();
+        }
+    }
+
+    /// @dev The timestamp through which `rentBalance` covers rent starting at `fromTime`.
+    ///      Invariant under accrual (accruing k seconds consumes exactly k*rps), so it is only
+    ///      recomputed when rentBalance, price or the tax base change. The runway is bounded by
+    ///      _checkPrepaidRunway, so the uint40 clamp below is unreachable in practice and kept
+    ///      only as a defensive cast.
+    function _paidThrough(uint256 fromTime, uint256 rentBalance, uint256 rps) internal pure returns (uint40) {
+        uint256 through = fromTime + rentBalance / rps;
+        return through > type(uint40).max ? type(uint40).max : uint40(through);
+    }
+
+    function _clearLease(PoolLeaseState storage state) internal {
+        // slot 0: clear only the lease fields - lastDripTime and hasPending keep governing the
+        // pending bucket, which may still be dripping after the lease is gone
+        state.executor = address(0);
+        state.paidThrough = 0;
+        state.lessee = address(0);
+        state.lastAccrualTime = 0;
+        state.price = 0;
+        state.rentBalance = 0;
+        state.minimumRentRemaining = 0;
+    }
+
+    /// @dev Moves rent owed since lastAccrualTime out of the lease: the protocol-fee share to
+    ///      protocolFeesAccrued, the rest RETURNED for the caller to deliver - _accrueAndDrip
+    ///      donates it directly to the in-range LPs who earned it; lease actions reach it the
+    ///      same way via _settleAccrualForLeaseAction and only park a throttled slice.
+    function _accrue(PoolId poolId, PoolLeaseConfig storage config, PoolLeaseState storage state)
+        internal
+        returns (uint256 netAccrued)
+    {
+        if (state.lessee == address(0)) {
+            return 0;
+        }
+        uint256 elapsed = block.timestamp - state.lastAccrualTime;
+        if (elapsed == 0) {
+            return 0;
+        }
+        state.lastAccrualTime = uint64(block.timestamp);
+
+        uint256 rentBalance = state.rentBalance;
+        if (rentBalance == 0) {
+            return 0;
+        }
+        // Rent is charged only for whole seconds the slot was actually served. paidThrough floors
+        // rentBalance / rps, so the sub-second remainder never bought discount time; it must stay
+        // refundable rather than be swept into the first accrual after the lease ran out.
+        uint256 rps = _rentPerSecond(config, state.price);
+        uint256 coveredSeconds = rentBalance / rps;
+        if (elapsed > coveredSeconds) {
+            elapsed = coveredSeconds;
+        }
+        uint256 owed = rps * elapsed;
+        if (owed == 0) {
+            return 0;
+        }
+        return _chargeRent(poolId, config, state, owed);
+    }
+
+    /// @dev Both elapsed rent and the final minimum charge use the same fee accounting.
+    ///      The entry commitment is backed by rentBalance and only decreases when rent is paid.
+    function _chargeRent(PoolId poolId, PoolLeaseConfig storage config, PoolLeaseState storage state, uint256 owed)
+        internal
+        returns (uint256 netAccrued)
+    {
+        state.rentBalance -= uint128(owed);
+        uint256 remaining = state.minimumRentRemaining;
+        state.minimumRentRemaining = owed >= remaining ? 0 : uint128(remaining - owed);
+
+        // carry the sub-bps remainder across accruals: fundRent-forced per-second slices would
+        // otherwise floor every slice's fee to zero, starving the protocol of its share
+        uint256 feeUnits = owed * config.protocolFeeBps + state.feeCarry;
+        uint256 protocolFee = feeUnits / BPS_DENOMINATOR;
+        state.feeCarry = uint16(feeUnits % BPS_DENOMINATOR);
+        if (protocolFee != 0) {
+            protocolFeesAccrued[config.auctionCurrency][config.protocolFeeRecipient] += protocolFee;
+        }
+        emit RentAccrued(poolId, owed, protocolFee, state.rentBalance);
+        // protocolFee <= owed always (bps <= 2000, carry < 10000: even owed == 1 yields fee <= 1)
+        return owed - protocolFee;
+    }
+
+    /// @dev Finalize the nonrefundable entry commitment on every termination path. Parking
+    ///      the LP share uses the existing anti-JIT throttle rather than donating an entire
+    ///      minimum payment to liquidity inserted in the same transaction as the exit.
+    function _settleMinimumRent(PoolId poolId, PoolLeaseConfig storage config, PoolLeaseState storage state) internal {
+        uint256 remaining = state.minimumRentRemaining;
+        if (remaining != 0) {
+            _addPending(config, state, _chargeRent(poolId, config, state, remaining));
+        }
+    }
+
+    /// @dev Lease actions (buyout, fundRent, setPrice, exitLease, evictLease) accrue outside the hook
+    ///      callbacks.
+    ///      The rent accrued since the last touch belongs to the LPs currently in range (the set has
+    ///      been constant since that touch), so deliver it the regular way - through our own unlock
+    ///      into `_accrueAndDrip`, which donates fresh rent directly - whenever the shared throttle
+    ///      allows. Parking it instead would let a lessee front-run an LP's removal with a 1-wei
+    ///      fundRent: the parked bucket re-inits the drip clock, the removal's touch is throttled,
+    ///      and the departing LP loses the rent of its whole tenure. Inside a throttle window the
+    ///      slice (at most minDripSeconds of rent) is parked, the granularity accepted everywhere.
+    function _settleAccrualForLeaseAction(
+        PoolKey calldata key,
+        PoolId poolId,
+        PoolLeaseConfig storage config,
+        PoolLeaseState storage state
+    ) internal {
+        uint40 last = state.lastDripTime;
+        if (last == 0 || block.timestamp >= uint256(last) + config.minDripSeconds) {
+            // unthrottled: unlockCallback -> _accrueAndDrip accrues and donates to the current LPs
+            // (or parks at zero liquidity / failed donate, re-initialising the clock as usual)
+            poolManager.unlock(abi.encode(key));
+            return;
+        }
+        _addPending(config, state, _accrue(poolId, config, state));
+    }
+
+    /// @dev Adds to the pending bucket, maintaining the hasPending slot-0 mirror and
+    ///      (re)initializing the drip clock whenever the bucket transitions from empty to
+    ///      non-empty. Without this, a lastDripTime left stale by a long-drained previous
+    ///      bucket would let the first drip of a fresh bucket compute a full-horizon elapsed
+    ///      interval and release the entire new bucket to a same-block JIT position.
+    ///      Also raises the bucket's release pace to one horizon of rent at the current lease
+    ///      price (the rate the parked value accrued at), see pendingReleasePerHorizon.
+    function _addPending(PoolLeaseConfig storage config, PoolLeaseState storage state, uint256 amount) internal {
+        if (amount == 0) {
+            return;
+        }
+        if (state.pendingDonation == 0) {
+            state.hasPending = true;
+            state.lastDripTime = uint40(block.timestamp);
+        }
+        uint256 pace = _rentPerSecond(config, state.price) * config.dripHorizonSeconds;
+        if (pace > MAX_ESCROW_AMOUNT) {
+            pace = MAX_ESCROW_AMOUNT; // releases are clamped to int128 range anyway
+        }
+        if (pace > state.pendingReleasePerHorizon) {
+            state.pendingReleasePerHorizon = uint128(pace);
+        }
+        state.pendingDonation += amount;
+    }
+
+    // ==================== Internal: dripping ====================
+
+    /// @dev Two delivery streams, mirroring HookAuctionController's design:
+    ///      1) FRESH rent (accrued since the last touch) donates DIRECTLY to the current
+    ///         in-range LPs - they are exactly who earned it: every liquidity change is itself
+    ///         a touch, so the set was constant over the accrual window, and a JIT's own mint
+    ///         touch pays the incumbents before its liquidity registers. This is what lets a
+    ///         departing LP (beforeRemoveLiquidity) collect the rent of its own tenure.
+    ///      2) The PENDING bucket - value that could not be delivered (zero liquidity, failed
+    ///         donates, lease-action accruals) - releases gradually: throttled by
+    ///         minDripSeconds, bounded per release to (elapsed / dripHorizonSeconds) of
+    ///         pendingReleasePerHorizon - one horizon of rent at the pace the value accrued -
+    ///         and NOT of the whole bucket (a fraction of the aggregate would hand a dust LP that
+    ///         appears after a long zero-liquidity gap a slice that grows with the gap), clock
+    ///         (re)initialized on every empty-to-nonempty transition and advanced over
+    ///         zero-liquidity stretches, so no stale interval can dump the bucket to a JIT.
+    ///      The shared throttle runs FIRST, from state slot 0 alone, so throttled touches skip
+    ///      the accrual math and every further storage read; accrual is time-based, so deferring
+    ///      it to the next unthrottled touch loses nothing (a topology change inside a throttle
+    ///      window shifts at most minDripSeconds of rent - the slice granularity everywhere).
+    function _accrueAndDrip(
+        PoolKey memory key,
+        PoolId poolId,
+        PoolLeaseConfig storage config,
+        PoolLeaseState storage state
+    ) internal returns (uint256 amountToDonate) {
+        uint40 last = state.lastDripTime;
+        if (last != 0 && block.timestamp < uint256(last) + config.minDripSeconds) {
+            return 0;
+        }
+
+        uint256 fresh;
+        if (state.executor != address(0)) {
+            fresh = _accrue(poolId, config, state);
+        }
+
+        bool zeroLiquidity = StateLibrary.getLiquidity(poolManager, poolId) == 0;
+
+        // 1) old bucket first (so the fresh rent cannot inflate this release), measured from
+        //    the pre-touch clock; hasPending implies last != 0 and, since this touch passed the
+        //    throttle, elapsed >= minDripSeconds
+        if (state.hasPending && !zeroLiquidity) {
+            uint256 pending = state.pendingDonation;
+            uint256 elapsed = block.timestamp - uint256(last);
+            if (elapsed > config.dripHorizonSeconds) {
+                elapsed = config.dripHorizonSeconds; // cap the catch-up at one horizon's worth
+            }
+            // Pace by one horizon of rent, never by the aggregate. Round UP so every release
+            // moves at least one base unit - the bucket self-drains without a flush-on-zero
+            // branch, which for a small bucket against a long horizon (e.g. low-decimal
+            // currencies) would dump the whole bucket to the first LP.
+            uint256 pace = state.pendingReleasePerHorizon;
+            if (pace > pending) {
+                pace = pending;
+            }
+            uint256 release = FullMath.mulDivRoundingUp(pace, elapsed, config.dripHorizonSeconds);
+            if (release > pending) {
+                release = pending;
+            }
+            if (release > MAX_ESCROW_AMOUNT) {
+                release = MAX_ESCROW_AMOUNT; // keep each donate within int128 range
+            }
+            uint256 released = _donate(key, poolId, config, release);
+            if (released != 0) {
+                uint256 pendingRemaining = pending - released;
+                state.pendingDonation = pendingRemaining;
+                if (pendingRemaining == 0) {
+                    state.hasPending = false;
+                    state.pendingReleasePerHorizon = 0;
+                }
+                amountToDonate = released;
+                emit PendingDonationDripped(poolId, released, pendingRemaining);
+            }
+            // on a failed release the value stays pending; the clock update below backs off
+            // for minDripSeconds instead of re-paying the failed transfer on every touch
+        }
+
+        // 2) fresh rent: straight to the LPs who were in range while it accrued; park it only
+        //    when it cannot be delivered
+        if (fresh != 0) {
+            uint256 freshDonated;
+            if (!zeroLiquidity) {
+                freshDonated = _donate(key, poolId, config, fresh);
+                if (freshDonated != 0) {
+                    amountToDonate += freshDonated;
+                    emit RentDripped(poolId, freshDonated);
+                }
+            }
+            if (freshDonated != fresh) {
+                _addPending(config, state, fresh - freshDonated);
+            }
+        }
+
+        // one shared clock update: throttles the next touch, backs off after failed donates,
+        // and advances over zero-liquidity stretches (so they never become catch-up slices)
+        if (fresh != 0 || state.hasPending) {
+            state.lastDripTime = uint40(block.timestamp);
+        }
+    }
+
+    /// @dev Donates `amount` of the auction currency to the pool's in-range liquidity.
+    ///      Returns 0 - without reverting - if the donate/settle leg reverts (e.g. a
+    ///      blacklisting or fee-on-transfer auction currency); the undonated value stays pending.
+    function _donate(PoolKey memory key, PoolId poolId, PoolLeaseConfig storage config, uint256 amount)
+        internal
+        returns (uint256 amountToDonate)
+    {
+        // External self-call so a revert in donate/sync/transfer/settle is caught here and
+        // rolls back only this donation (the delta it created is undone with it).
+        try this.donateExternal(key, config.auctionCurrency, amount) {
+            amountToDonate = amount;
+        } catch {
+            emit DonateFailed(poolId, amount);
+            return 0;
+        }
+    }
+
+    /// @dev Self-only executor for a single donation, so `_donate` can wrap it in try/catch.
+    ///      Runs inside the same PoolManager unlock as the caller. Verifies BOTH sides of the
+    ///      transfer exactly - see HookAuctionController.donateExternal for the full rationale.
+    ///
+    ///      @custom:accepted-risk AUDIT-ACCEPTED-CONTROLLER-DRIP-SYNC
+    ///      Same accepted constraint as HookAuctionController.donateExternal: the sync -> transfer
+    ///      -> settle here overwrites and clears the PoolManager's single synced-currency record
+    ///      inside the integrator's unlock, so a caller that PRE-paid with `sync -> transfer -> swap
+    ///      -> settle` reverts CurrencyNotSettled (atomically; no funds at risk). Assumed: integrators
+    ///      sync immediately before paying, as every standard router and this hook do.
+    function donateExternal(PoolKey calldata key, Currency currency, uint256 amount) external {
+        if (msg.sender != address(this)) {
+            revert Unauthorized();
+        }
+        bool isCurrency0 = currency == key.currency0;
+        poolManager.donate(key, isCurrency0 ? amount : 0, isCurrency0 ? 0 : amount, "");
+
+        poolManager.sync(currency);
+        IERC20 token = IERC20(Currency.unwrap(currency));
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransfer(address(poolManager), amount);
+        if (poolManager.settle() != amount) {
+            revert ExactTransferFailed();
+        }
+        if (balanceBefore - token.balanceOf(address(this)) != amount) {
+            revert ExactTransferFailed();
+        }
+    }
+
+    // ==================== Internal: token movement ====================
+
+    /// @dev Pulls `amount` from msg.sender, reverting unless this contract's balance increases by
+    ///      exactly `amount` (fee-on-transfer deposits would corrupt the escrow accounting).
+    function _pullExact(Currency currency, uint256 amount) internal {
+        IERC20 token = IERC20(Currency.unwrap(currency));
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        if (token.balanceOf(address(this)) - balanceBefore != amount) {
+            revert ExactTransferFailed();
+        }
+    }
+
+    /// @dev Transfers `amount` out, reverting unless this contract's balance decreases by exactly
+    ///      `amount` - a sender-side surcharge would silently consume funds backing the other
+    ///      escrowed obligations (deposits, refunds, protocol fees, pending donations).
+    function _transferOutExact(Currency currency, address recipient, uint256 amount) internal {
+        IERC20 token = IERC20(Currency.unwrap(currency));
+        uint256 balanceBefore = token.balanceOf(address(this));
+        token.safeTransfer(recipient, amount);
+        if (balanceBefore - token.balanceOf(address(this)) != amount) {
+            revert ExactTransferFailed();
+        }
+    }
+}

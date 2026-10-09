@@ -1,0 +1,368 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Script, console} from "forge-std/Script.sol";
+
+import {V4Utils} from "src/vault/transformers/V4Utils.sol";
+import {V4Oracle, AggregatorV3Interface, IUniswapV3Pool} from "src/oracle/V4Oracle.sol";
+import {V4Vault} from "src/vault/V4Vault.sol";
+import {InterestRateModel} from "src/vault/InterestRateModel.sol";
+import {FlashloanLiquidator} from "src/vault/liquidation/FlashloanLiquidator.sol";
+import {LeverageTransformer} from "src/vault/transformers/LeverageTransformer.sol";
+import {LiquidityCalculator, ILiquidityCalculator} from "src/shared/math/LiquidityCalculator.sol";
+import {RevertHook} from "src/RevertHook.sol";
+import {HookFeeController} from "src/hook/HookFeeController.sol";
+import {HookAuctionController} from "src/hook/HookAuctionController.sol";
+import {HookRouteController} from "src/hook/HookRouteController.sol";
+import {RevertHookSwapActions} from "src/hook/RevertHookSwapActions.sol";
+import {RevertHookPositionActions} from "src/hook/RevertHookPositionActions.sol";
+import {RevertHookAutoLeverageActions} from "src/hook/RevertHookAutoLeverageActions.sol";
+import {RevertHookAutoLendActions} from "src/hook/RevertHookAutoLendActions.sol";
+import {RevertHookMigrationActions} from "src/hook/RevertHookMigrationActions.sol";
+
+import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
+import {IPermit2} from "@uniswap/v4-periphery/lib/permit2/src/interfaces/IPermit2.sol";
+import {IWETH9} from "@uniswap/v4-periphery/src/interfaces/external/IWETH9.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+
+/// @title DeployMainnet
+/// @notice Deployment script for RevertHook and all related contracts on Ethereum mainnet
+/// @dev Run with: forge script script/DeployMainnet.s.sol:DeployMainnet --chain-id 1 --rpc-url <rpc> --broadcast --verify
+contract DeployMainnet is Script {
+    uint256 constant Q32 = 2 ** 32;
+    uint256 constant Q64 = 2 ** 64;
+
+    // ==================== Mainnet Contract Addresses ====================
+
+    IPositionManager constant POSITION_MANAGER = IPositionManager(0xbD216513d74C8cf14cf4747E6AaA6420FF64ee9e);
+    address constant UNIVERSAL_ROUTER = 0x66a9893cC07D91D95644AEDD05D03f95e1dBA8Af;
+    address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+    address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+    address constant ZEROX_ALLOWANCE_HOLDER = 0x0000000000001fF3684f28c67538d4D072C22734;
+
+    // ==================== Mainnet Token Addresses ====================
+
+    address constant USDC = 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48;
+    address constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
+    address constant ETH = address(0);
+    address constant USD_REFERENCE = 0x000000000000000000000000000000000000dEaD;
+
+    // ==================== Mainnet Chainlink Feeds ====================
+
+    address constant CHAINLINK_USDC_USD = 0x8fFfFfd4AfB6115b954Bd326cbe7B4BA576818f6;
+    address constant CHAINLINK_ETH_USD = 0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419;
+
+    // ==================== Mainnet Uniswap v3 TWAP Pools ====================
+
+    address constant UNISWAP_V3_USDC_WETH = 0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640; // 0.05% pool
+
+    // ==================== Configuration Constants ====================
+
+    // Chainlink max feed ages, one per feed. Each value must be >= the feed's heartbeat plus a
+    // margin: a too-low value makes borrow, transform AND liquidate revert on every valuation
+    // once the price has not moved enough to publish a new round (see DeployBase, where a shared
+    // one-hour limit took the USDC vault down).
+    //
+    // Verified heartbeats, 2026-09-22 (Chainlink reference data directory, cross-checked against the
+    // last 40 rounds of each proxy on chain; observed max gaps in brackets):
+    //   USDC/USD 0x8fFfFfd4...  82800 s / 0.25% [82836 s]
+    //   ETH/USD  0x5f4eC3Df...   3600 s / 0.5%  [3636 s] - a bare 1 hour leaves no margin
+    // Re-check on the provider's feed page before every deployment; Chainlink changes these.
+    uint32 constant USDC_MAX_FEED_AGE = 25 hours;
+    uint32 constant ETH_MAX_FEED_AGE = 2 hours;
+    uint16 constant MAX_POOL_PRICE_DIFFERENCE = 200;
+    uint32 constant ORACLE_TWAP_SECONDS = 30 minutes;
+    uint16 constant MAX_ORACLE_SOURCE_DIFFERENCE = 200;
+
+    uint256 constant BASE_RATE_PER_YEAR = 0;
+    uint256 constant MULTIPLIER_PER_YEAR = Q64 * 5 / 100;
+    uint256 constant JUMP_MULTIPLIER_PER_YEAR = Q64 * 109 / 100;
+    uint256 constant KINK = Q64 * 80 / 100;
+
+    uint32 constant CF_STABLECOIN = uint32(Q32 * 850 / 1000);
+    uint32 constant CF_ETH = uint32(Q32 * 775 / 1000);
+
+    uint16 constant PROTOCOL_FEE_BPS = 100;
+    int24 constant MAX_TICKS_FROM_ORACLE = 100;
+    uint256 constant MIN_POSITION_VALUE_NATIVE = 0.01 ether;
+
+    uint256 constant MIN_LOAN_SIZE = 100000;
+    uint256 constant GLOBAL_LEND_LIMIT = 1000000000000;
+    uint256 constant GLOBAL_DEBT_LIMIT = 399000000000000;
+    uint256 constant DAILY_LEND_INCREASE_LIMIT_MIN = 100000000000;
+    uint256 constant DAILY_DEBT_INCREASE_LIMIT_MIN = 75000000000;
+
+    uint256 constant MAX_LOOP = 500_000;
+
+    function getHookFlags() internal pure returns (uint160) {
+        return uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG
+                | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+    }
+
+    function findHookSalt(address deployer, bytes memory creationCodeWithArgs)
+        internal
+        view
+        returns (address hookAddress, bytes32 salt)
+    {
+        uint160 flags = getHookFlags();
+        uint160 flagMask = Hooks.ALL_HOOK_MASK;
+        flags = flags & flagMask;
+
+        for (uint256 i; i < MAX_LOOP; i++) {
+            salt = bytes32(i);
+            hookAddress = computeCreate2Address(deployer, salt, creationCodeWithArgs);
+
+            if (uint160(hookAddress) & flagMask == flags && hookAddress.code.length == 0) {
+                return (hookAddress, salt);
+            }
+        }
+        revert("DeployMainnet: could not find valid hook salt");
+    }
+
+    function computeCreate2Address(address deployer, bytes32 salt, bytes memory creationCodeWithArgs)
+        internal
+        pure
+        returns (address)
+    {
+        return address(
+            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xFF), deployer, salt, keccak256(creationCodeWithArgs)))))
+        );
+    }
+
+    function run() external {
+        address deployer = msg.sender;
+        address zeroXAllowanceHolder = vm.envOr("ZEROX_ALLOWANCE_HOLDER", ZEROX_ALLOWANCE_HOLDER);
+
+        vm.startBroadcast();
+
+        console.log("==============================================");
+        console.log("Deploying Revert infrastructure on Mainnet...");
+        console.log("==============================================");
+        console.log("Deployer:", deployer);
+        console.log("0x AllowanceHolder:", zeroXAllowanceHolder);
+        console.log("");
+
+        console.log("Step 1: Deploying Core Infrastructure...");
+        InterestRateModel interestRateModel =
+            new InterestRateModel(BASE_RATE_PER_YEAR, MULTIPLIER_PER_YEAR, JUMP_MULTIPLIER_PER_YEAR, KINK);
+        console.log("  InterestRateModel deployed at:", address(interestRateModel));
+
+        LiquidityCalculator liquidityCalculator = new LiquidityCalculator();
+        console.log("  LiquidityCalculator deployed at:", address(liquidityCalculator));
+
+        console.log("Step 2: Deploying V4Oracle...");
+        V4Oracle oracle = new V4Oracle(POSITION_MANAGER, WETH, USD_REFERENCE);
+        console.log("  V4Oracle deployed at:", address(oracle));
+
+        oracle.setMaxPoolPriceDifference(MAX_POOL_PRICE_DIFFERENCE);
+        oracle.setSequencerUptimeFeed(address(0));
+        oracle.setTokenConfig(
+            USDC,
+            AggregatorV3Interface(CHAINLINK_USDC_USD),
+            USDC_MAX_FEED_AGE,
+            IUniswapV3Pool(UNISWAP_V3_USDC_WETH),
+            USDC,
+            ORACLE_TWAP_SECONDS,
+            V4Oracle.Mode.CHAINLINK_TWAP_VERIFY,
+            MAX_ORACLE_SOURCE_DIFFERENCE
+        );
+        oracle.setTokenConfig(
+            WETH,
+            AggregatorV3Interface(CHAINLINK_ETH_USD),
+            ETH_MAX_FEED_AGE,
+            IUniswapV3Pool(address(0)),
+            WETH,
+            ORACLE_TWAP_SECONDS,
+            V4Oracle.Mode.CHAINLINK_TWAP_VERIFY,
+            MAX_ORACLE_SOURCE_DIFFERENCE
+        );
+        oracle.setTokenConfig(
+            ETH,
+            AggregatorV3Interface(CHAINLINK_ETH_USD),
+            ETH_MAX_FEED_AGE,
+            IUniswapV3Pool(address(0)),
+            WETH,
+            ORACLE_TWAP_SECONDS,
+            V4Oracle.Mode.CHAINLINK_TWAP_VERIFY,
+            MAX_ORACLE_SOURCE_DIFFERENCE
+        );
+        console.log("  Configured two-source oracle for USDC and canonical ETH/WETH feeds");
+
+        console.log("Step 3: Deploying RevertHook action contracts...");
+        uint64 hookSidecarNonce = vm.getNonce(deployer);
+        address predictedFeeController = vm.computeCreateAddress(deployer, hookSidecarNonce);
+        address predictedRouteController = vm.computeCreateAddress(deployer, hookSidecarNonce + 1);
+        address predictedSwapActions = vm.computeCreateAddress(deployer, hookSidecarNonce + 2);
+        address predictedPositionActions = vm.computeCreateAddress(deployer, hookSidecarNonce + 3);
+        address predictedAutoLeverageActions = vm.computeCreateAddress(deployer, hookSidecarNonce + 4);
+        address predictedAutoLendActions = vm.computeCreateAddress(deployer, hookSidecarNonce + 5);
+        address predictedMigrationActions = vm.computeCreateAddress(deployer, hookSidecarNonce + 6);
+        address predictedAuctionController = vm.computeCreateAddress(deployer, hookSidecarNonce + 7);
+
+        bytes memory constructorArgs = abi.encode(
+            deployer,
+            oracle,
+            HookFeeController(predictedFeeController),
+            HookAuctionController(predictedAuctionController),
+            RevertHookPositionActions(predictedPositionActions),
+            RevertHookAutoLeverageActions(predictedAutoLeverageActions),
+            RevertHookAutoLendActions(predictedAutoLendActions),
+            RevertHookMigrationActions(predictedMigrationActions)
+        );
+        bytes memory creationCodeWithArgs = abi.encodePacked(type(RevertHook).creationCode, constructorArgs);
+
+        console.log("Step 4: Deploying RevertHook with CREATE2 address mining...");
+        console.log("  Mining for valid hook address...");
+        (address expectedHookAddress, bytes32 salt) = findHookSalt(CREATE2_DEPLOYER, creationCodeWithArgs);
+        console.log("  Found valid hook address:", expectedHookAddress);
+        console.log("  Using salt:", vm.toString(salt));
+
+        HookFeeController feeController =
+            new HookFeeController(expectedHookAddress, deployer, PROTOCOL_FEE_BPS, PROTOCOL_FEE_BPS);
+        require(address(feeController) == predictedFeeController, "Fee controller address mismatch");
+        console.log("  HookFeeController deployed at:", address(feeController));
+        HookRouteController routeController = new HookRouteController(expectedHookAddress);
+        require(address(routeController) == predictedRouteController, "Route controller address mismatch");
+        console.log("  HookRouteController deployed at:", address(routeController));
+        RevertHookSwapActions swapActions = new RevertHookSwapActions(oracle.poolManager(), feeController);
+        require(address(swapActions) == predictedSwapActions, "Swap actions address mismatch");
+        console.log("  RevertHookSwapActions deployed at:", address(swapActions));
+
+        RevertHookPositionActions positionActions = new RevertHookPositionActions(
+            IPermit2(PERMIT2), oracle, ILiquidityCalculator(liquidityCalculator), routeController, swapActions
+        );
+        console.log("  RevertHookPositionActions deployed at:", address(positionActions));
+
+        RevertHookAutoLeverageActions autoLeverageActions = new RevertHookAutoLeverageActions(
+            IPermit2(PERMIT2), oracle, ILiquidityCalculator(liquidityCalculator), routeController, swapActions
+        );
+        console.log("  RevertHookAutoLeverageActions deployed at:", address(autoLeverageActions));
+
+        RevertHookAutoLendActions autoLendActions = new RevertHookAutoLendActions(
+            IPermit2(PERMIT2),
+            oracle,
+            ILiquidityCalculator(liquidityCalculator),
+            feeController,
+            routeController,
+            swapActions
+        );
+        console.log("  RevertHookAutoLendActions deployed at:", address(autoLendActions));
+
+        // Deploy RevertHookMigrationActions (delegatecall target 4: remint migration + add-liquidity tail)
+        RevertHookMigrationActions migrationActions = new RevertHookMigrationActions(
+            IPermit2(PERMIT2), oracle, ILiquidityCalculator(liquidityCalculator), routeController, swapActions
+        );
+        require(address(migrationActions) == predictedMigrationActions, "Migration actions address mismatch");
+        console.log("  RevertHookMigrationActions deployed at:", address(migrationActions));
+
+        HookAuctionController auctionController = new HookAuctionController(expectedHookAddress, oracle.poolManager());
+        require(address(auctionController) == predictedAuctionController, "Auction controller address mismatch");
+        console.log("  HookAuctionController deployed at:", address(auctionController));
+
+        RevertHook revertHook = new RevertHook{salt: salt}(
+            deployer,
+            oracle,
+            feeController,
+            auctionController,
+            positionActions,
+            autoLeverageActions,
+            autoLendActions,
+            migrationActions
+        );
+        require(address(revertHook) == expectedHookAddress, "Hook address mismatch");
+        console.log("  RevertHook deployed at:", address(revertHook));
+
+        revertHook.setMaxTicksFromOracle(MAX_TICKS_FROM_ORACLE);
+        revertHook.setMinPositionValueNative(MIN_POSITION_VALUE_NATIVE);
+        console.log("  RevertHook configured");
+
+        // Seed the executor denylist with the canonical shared router so a bidder cannot register
+        // it as their executor and hand the discounted fee to all of the router's traffic for the
+        // epoch. Extend this with any other shared routers / aggregators used on this chain.
+        auctionController.setExecutorDenied(UNIVERSAL_ROUTER, true);
+        console.log("  Executor denylist seeded (UniversalRouter):", UNIVERSAL_ROUTER);
+
+        console.log("Step 5: Deploying V4Vault (USDC)...");
+        V4Vault vault =
+            new V4Vault("Revert Lend USDC", "rlUSDC", USDC, POSITION_MANAGER, interestRateModel, oracle, IWETH9(WETH));
+        console.log("  V4Vault deployed at:", address(vault));
+
+        vault.setTokenConfig(USDC, CF_STABLECOIN, type(uint32).max);
+        vault.setTokenConfig(WETH, CF_ETH, type(uint32).max);
+        vault.setTokenConfig(ETH, CF_ETH, type(uint32).max);
+        console.log("  Configured collateral tokens (USDC, WETH, ETH)");
+
+        vault.setLimits(
+            MIN_LOAN_SIZE,
+            GLOBAL_LEND_LIMIT,
+            GLOBAL_DEBT_LIMIT,
+            DAILY_LEND_INCREASE_LIMIT_MIN,
+            DAILY_DEBT_INCREASE_LIMIT_MIN
+        );
+        vault.setReserveFactor(uint32(Q32 * 10 / 100));
+        vault.setReserveProtectionFactor(uint32(Q32 * 5 / 100));
+        console.log("  Configured vault limits and reserve factors");
+
+        console.log("Step 6: Deploying transformers...");
+        FlashloanLiquidator flashloanLiquidator =
+            new FlashloanLiquidator(POSITION_MANAGER, UNIVERSAL_ROUTER, zeroXAllowanceHolder);
+        console.log("  FlashloanLiquidator deployed at:", address(flashloanLiquidator));
+
+        V4Utils v4Utils = new V4Utils(POSITION_MANAGER, UNIVERSAL_ROUTER, zeroXAllowanceHolder, IPermit2(PERMIT2));
+        console.log("  V4Utils deployed at:", address(v4Utils));
+
+        LeverageTransformer leverageTransformer =
+            new LeverageTransformer(POSITION_MANAGER, UNIVERSAL_ROUTER, zeroXAllowanceHolder, IPermit2(PERMIT2));
+        console.log("  LeverageTransformer deployed at:", address(leverageTransformer));
+
+        console.log("Step 7: Configuring integrations...");
+        v4Utils.setVault(address(vault));
+        vault.setTransformer(address(v4Utils), true);
+        console.log("  V4Utils registered with vault");
+
+        leverageTransformer.setVault(address(vault));
+        vault.setTransformer(address(leverageTransformer), true);
+        console.log("  LeverageTransformer registered with vault");
+
+        revertHook.setVault(address(vault));
+        vault.setTransformer(address(revertHook), true);
+        console.log("  RevertHook registered as vault transformer");
+
+        oracle.setHookFeeQuoter(address(revertHook), address(feeController));
+        vault.setHookAllowList(address(revertHook), true);
+        console.log("  RevertHook added to vault hook allowlist");
+
+        revertHook.setAutoLendVault(USDC, vault);
+        console.log("  Auto-lend vault configured for USDC");
+
+        vm.stopBroadcast();
+
+        console.log("");
+        console.log("==============================================");
+        console.log("              DEPLOYMENT SUMMARY               ");
+        console.log("==============================================");
+        console.log("Network: Ethereum Mainnet (Chain ID: 1)");
+        console.log("----------------------------------------------");
+        console.log("Core Infrastructure:");
+        console.log("  InterestRateModel:          ", address(interestRateModel));
+        console.log("  LiquidityCalculator:        ", address(liquidityCalculator));
+        console.log("  V4Oracle:                   ", address(oracle));
+        console.log("----------------------------------------------");
+        console.log("Hook Contracts:");
+        console.log("  RevertHookPositionActions:  ", address(positionActions));
+        console.log("  RevertHookAutoLeverageActions:", address(autoLeverageActions));
+        console.log("  RevertHookAutoLendActions:  ", address(autoLendActions));
+        console.log("  RevertHook:                 ", address(revertHook));
+        console.log("----------------------------------------------");
+        console.log("Vault & Transformers:");
+        console.log("  V4Vault (rlUSDC):           ", address(vault));
+        console.log("  V4Utils:                    ", address(v4Utils));
+        console.log("  LeverageTransformer:        ", address(leverageTransformer));
+        console.log("  FlashloanLiquidator:        ", address(flashloanLiquidator));
+        console.log("==============================================");
+    }
+}

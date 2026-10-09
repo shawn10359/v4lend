@@ -1,0 +1,596 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import {Script, console} from "forge-std/Script.sol";
+
+import {V4Utils} from "src/vault/transformers/V4Utils.sol";
+import {V4Oracle, AggregatorV3Interface, IUniswapV3Pool} from "src/oracle/V4Oracle.sol";
+import {V4Vault} from "src/vault/V4Vault.sol";
+import {InterestRateModel} from "src/vault/InterestRateModel.sol";
+import {FlashloanLiquidator} from "src/vault/liquidation/FlashloanLiquidator.sol";
+import {LeverageTransformer} from "src/vault/transformers/LeverageTransformer.sol";
+import {LiquidityCalculator, ILiquidityCalculator} from "src/shared/math/LiquidityCalculator.sol";
+import {RevertHook} from "src/RevertHook.sol";
+import {HookFeeController} from "src/hook/HookFeeController.sol";
+import {HookAuctionController} from "src/hook/HookAuctionController.sol";
+import {HookRouteController} from "src/hook/HookRouteController.sol";
+import {RevertHookSwapActions} from "src/hook/RevertHookSwapActions.sol";
+import {RevertHookPositionActions} from "src/hook/RevertHookPositionActions.sol";
+import {RevertHookAutoLeverageActions} from "src/hook/RevertHookAutoLeverageActions.sol";
+import {RevertHookAutoLendActions} from "src/hook/RevertHookAutoLendActions.sol";
+import {RevertHookMigrationActions} from "src/hook/RevertHookMigrationActions.sol";
+
+import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
+import {IPermit2} from "@uniswap/v4-periphery/lib/permit2/src/interfaces/IPermit2.sol";
+import {IWETH9} from "@uniswap/v4-periphery/src/interfaces/external/IWETH9.sol";
+import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+
+/// @title DeployUnichain
+/// @notice Deployment script for RevertHook and all related contracts on Unichain
+/// @dev Run with: forge script script/DeployUnichain.s.sol:DeployUnichain --chain-id 130 --rpc-url <rpc> --broadcast --verify
+contract DeployUnichain is Script {
+    uint256 constant Q32 = 2 ** 32;
+    uint256 constant Q64 = 2 ** 64;
+
+    // ==================== Unichain Contract Addresses ====================
+    // Source: https://docs.uniswap.org/contracts/v4/deployments
+
+    IPositionManager constant POSITION_MANAGER = IPositionManager(0x4529A01c7A0410167c5740C487A8DE60232617bf);
+    address constant UNIVERSAL_ROUTER = 0xEf740bf23aCaE26f6492B10de645D6B98dC8Eaf3;
+    address constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+
+    // CREATE2 Deployer Proxy used by Forge for CREATE2 deployments
+    address constant CREATE2_DEPLOYER = 0x4e59b44847b379578588920cA78FbF26c0B4956C;
+
+    // 0x Protocol AllowanceHolder for Cancun hardfork chains, including Unichain.
+    // Source: https://docs.0x.org/docs/core-concepts/0x-cheat-sheet
+    address constant ZEROX_ALLOWANCE_HOLDER = 0x0000000000001fF3684f28c67538d4D072C22734;
+
+    // ==================== Unichain Token Addresses ====================
+    // Common token addresses on Unichain mainnet
+
+    address constant WETH = 0x4200000000000000000000000000000000000006; // Standard OP Stack WETH
+    address constant ETH = address(0);
+    address constant USD_REFERENCE = 0x000000000000000000000000000000000000dEaD;
+
+    // Stablecoins
+    address constant USDC = 0x078D782b760474a361dDA0AF3839290b0EF57AD6;
+    address constant USDT = 0x9151434b16b9763660705744891fA906F660EcC5;
+    address constant DAI = 0x20CAb320A855b39F724131C69424240519573f81;
+
+    // Other tokens
+    address constant WBTC = 0x0555E30da8f98308EdB960aa94C0Db47230d2B9c;
+    address constant UNI = 0x8f187aA05619a017077f5308904739877ce9eA21;
+
+    // ==================== RedStone Oracle Feed Addresses ====================
+    // Source: https://docs.redstone.finance - Classic/Push Model feeds on Unichain
+    // These implement the Chainlink AggregatorV3Interface
+
+    address constant REDSTONE_ETH_USD = 0xe8D9FbC10e00ecc9f0694617075fDAF657a76FB2;
+    address constant REDSTONE_BTC_USD = 0xc44be6D00307c3565FDf753e852Fc003036cBc13;
+    address constant REDSTONE_USDC_USD = 0xD15862FC3D5407A03B696548b6902D6464A69b8c;
+    address constant REDSTONE_USDT_USD = 0x58fa68A373956285dDfb340EDf755246f8DfCA16;
+    address constant REDSTONE_DAI_USD = 0xE94c9f9A1893f23be38A5C0394E46Ac05e8a5f8C;
+    address constant REDSTONE_UNI_USD = 0xf1454949C6dEdfb500ae63Aa6c784Aa1Dde08A6c;
+
+    // ==================== Unichain Uniswap v3 TWAP Pools ====================
+    // Unichain's deepest v3 oracle routes for this USDC vault are USDC-referenced.
+    // Pool choices were checked against the Unichain v3 factory at
+    // 0x1f98400000000000000000000000000000000003.
+
+    address constant ORACLE_REFERENCE_TOKEN = USDC;
+    address constant UNISWAP_V3_WETH_USDC = 0x8927058918e3CFf6F55EfE45A58db1be1F069E49; // 0.30% pool
+    address constant UNISWAP_V3_USDT_USDC = 0xe92c7cc875245A86fAf088fEbE4614E1E318BeF5; // 0.05% pool
+    address constant UNISWAP_V3_DAI_USDC = 0x1Db0BcA1D1a09E5A86213D349fA4fe33F8FE7Fe2; // 0.01% pool, thin
+    address constant UNISWAP_V3_UNI_USDC = 0xff3D4aF6AEd14F62c202D55871f75C37951409c3; // 0.30% pool
+
+    // No production-grade WBTC/USDC v3 pool exists on Unichain at the time this config was prepared.
+    // Keep WBTC out of production collateral until a nonzero-liquidity, TWAP-ready pool is available.
+    address constant UNISWAP_V3_WBTC_USDC = address(0);
+
+    // L2 Sequencer Uptime Feed (for L2 oracle safety).
+    // Chainlink does not list a Unichain sequencer uptime feed; keep zero until a provider publishes one.
+    address constant SEQUENCER_UPTIME_FEED = address(0);
+
+    // ==================== Configuration Constants ====================
+
+    // Feed max ages, one per feed. Each value must be >= the feed's heartbeat plus a margin: a
+    // too-low value makes borrow, transform AND liquidate revert on every valuation once the
+    // price has not moved enough to publish a new round (see DeployBase, where a shared one-hour
+    // limit took the USDC vault down).
+    //
+    // Verified heartbeats, 2026-09-22, from RedStone's relayer manifest for these exact feed
+    // addresses (redstone-oracles-monorepo: packages/relayer-remote-config/main/
+    // relayer-manifests-multi-feed/unichainMultiFeed.json, adapter 0xFB1267A2...):
+    //   USDC/USD 0xD15862FC...  10800 s / 0.5%    USDT/USD 0x58fa68A3...  10800 s / 0.5%    DAI/USD 0xE94c9f9A...  10800 s / 0.5%
+    //   ETH/USD  0xe8D9FbC1...  21600 s / 0.5%    BTC/USD  0xc44be6D0...  21600 s / 0.5%    UNI/USD 0xf1454949...  86400 s / 1%
+    // The previous 2 hour values for ETH/BTC/UNI were below the heartbeat and would have taken
+    // the vault down in a flat market. Re-check the manifest before every deployment.
+    uint32 constant USDC_MAX_FEED_AGE = 4 hours;
+    uint32 constant USDT_MAX_FEED_AGE = 4 hours;
+    uint32 constant DAI_MAX_FEED_AGE = 4 hours;
+    uint32 constant ETH_MAX_FEED_AGE = 7 hours;
+    uint32 constant BTC_MAX_FEED_AGE = 7 hours;
+    uint32 constant UNI_MAX_FEED_AGE = 25 hours;
+    uint16 constant MAX_POOL_PRICE_DIFFERENCE = 200; // 2% max difference between pool and oracle price
+    uint32 constant ORACLE_TWAP_SECONDS = 30 minutes;
+    uint16 constant MAX_ORACLE_SOURCE_DIFFERENCE = 200;
+
+    // Interest rate model parameters (similar to Compound V2)
+    uint256 constant BASE_RATE_PER_YEAR = 0; // 0% base rate
+    uint256 constant MULTIPLIER_PER_YEAR = Q64 * 5 / 100; // 5% at kink
+    uint256 constant JUMP_MULTIPLIER_PER_YEAR = Q64 * 109 / 100; // 109% above kink
+    uint256 constant KINK = Q64 * 80 / 100; // 80% utilization kink
+
+    // Collateral factors (in Q32 format)
+    uint32 constant CF_STABLECOIN = uint32(Q32 * 850 / 1000); // 85% for stablecoins
+    uint32 constant CF_ETH = uint32(Q32 * 775 / 1000); // 77.5% for ETH
+    uint32 constant CF_BTC = uint32(Q32 * 750 / 1000); // 75% for BTC
+    uint32 constant CF_OTHER = uint32(Q32 * 650 / 1000); // 65% for other tokens
+
+    // RevertHook configuration
+    uint16 constant PROTOCOL_FEE_BPS = 100; // 1% protocol fee
+    int24 constant MAX_TICKS_FROM_ORACLE = 100; // Max tick deviation from oracle price
+    uint256 constant MIN_POSITION_VALUE_NATIVE = 0.01 ether; // Minimum position value
+
+    // Vault configuration
+    uint256 constant MIN_LOAN_SIZE = 100000; // 0.1 USDC (6 decimals)
+    uint256 constant GLOBAL_LEND_LIMIT = 1000000000000; // 1M USDC
+    uint256 constant GLOBAL_DEBT_LIMIT = 399000000000000; // 399M USDC
+    uint256 constant DAILY_LEND_INCREASE_LIMIT_MIN = 100000000000; // 100K USDC
+    uint256 constant DAILY_DEBT_INCREASE_LIMIT_MIN = 75000000000; // 75K USDC
+
+    // Maximum iterations for hook address mining
+    uint256 constant MAX_LOOP = 500_000;
+
+    /// @notice RevertHook required flags based on getHookPermissions()
+    /// afterInitialize, beforeAddLiquidity, afterAddLiquidity, afterRemoveLiquidity, afterSwap,
+    /// afterAddLiquidityReturnDelta, afterRemoveLiquidityReturnDelta
+    function getHookFlags() internal pure returns (uint160) {
+        return uint160(
+            Hooks.AFTER_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.AFTER_ADD_LIQUIDITY_FLAG
+                | Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG | Hooks.AFTER_REMOVE_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG
+                | Hooks.AFTER_SWAP_FLAG | Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
+                | Hooks.AFTER_REMOVE_LIQUIDITY_RETURNS_DELTA_FLAG
+        );
+    }
+
+    /// @notice Find a salt that produces a hook address with the correct flags
+    /// @dev Uses CREATE2 address computation to mine for valid hook addresses
+    /// @param deployer The address that will deploy the hook (msg.sender in broadcast context)
+    /// @param creationCodeWithArgs The creation code with constructor args appended
+    function findHookSalt(address deployer, bytes memory creationCodeWithArgs)
+        internal
+        view
+        returns (address hookAddress, bytes32 salt)
+    {
+        uint160 flags = getHookFlags();
+        uint160 flagMask = Hooks.ALL_HOOK_MASK;
+        flags = flags & flagMask;
+
+        for (uint256 i; i < MAX_LOOP; i++) {
+            salt = bytes32(i);
+            hookAddress = computeCreate2Address(deployer, salt, creationCodeWithArgs);
+
+            if (uint160(hookAddress) & flagMask == flags && hookAddress.code.length == 0) {
+                return (hookAddress, salt);
+            }
+        }
+        revert("DeployUnichain: could not find valid hook salt");
+    }
+
+    /// @notice Compute CREATE2 address
+    /// @param deployer The address deploying the contract
+    /// @param salt The CREATE2 salt
+    /// @param creationCodeWithArgs The creation code with constructor args
+    function computeCreate2Address(address deployer, bytes32 salt, bytes memory creationCodeWithArgs)
+        internal
+        pure
+        returns (address)
+    {
+        return address(
+            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xFF), deployer, salt, keccak256(creationCodeWithArgs)))))
+        );
+    }
+
+    function _configureOracleToken(
+        V4Oracle oracle,
+        address token,
+        AggregatorV3Interface feed,
+        uint32 maxFeedAge,
+        address twapPool,
+        address twapTokenAlias,
+        bool allowSingleSourceOracle
+    ) internal {
+        V4Oracle.Mode mode;
+        IUniswapV3Pool pool;
+
+        if (twapTokenAlias == ORACLE_REFERENCE_TOKEN) {
+            mode = V4Oracle.Mode.CHAINLINK_TWAP_VERIFY;
+            pool = IUniswapV3Pool(address(0));
+        } else if (twapPool != address(0)) {
+            mode = V4Oracle.Mode.CHAINLINK_TWAP_VERIFY;
+            pool = IUniswapV3Pool(twapPool);
+        } else if (allowSingleSourceOracle) {
+            mode = V4Oracle.Mode.CHAINLINK;
+            pool = IUniswapV3Pool(address(0));
+        } else {
+            revert("DeployUnichain: missing TWAP pool");
+        }
+
+        oracle.setTokenConfig(
+            token, feed, maxFeedAge, pool, twapTokenAlias, ORACLE_TWAP_SECONDS, mode, MAX_ORACLE_SOURCE_DIFFERENCE
+        );
+    }
+
+    function _requireProductionTWAPPools() internal pure {
+        if (
+            UNISWAP_V3_WETH_USDC == address(0) || UNISWAP_V3_USDT_USDC == address(0)
+                || UNISWAP_V3_DAI_USDC == address(0) || UNISWAP_V3_UNI_USDC == address(0)
+        ) {
+            revert("DeployUnichain: missing production TWAP pools");
+        }
+    }
+
+    function run() external {
+        // Get deployer address for protocol fee recipient
+        address deployer = msg.sender;
+        address zeroXAllowanceHolder = vm.envOr("ZEROX_ALLOWANCE_HOLDER", ZEROX_ALLOWANCE_HOLDER);
+        address sequencerUptimeFeed = vm.envOr("SEQUENCER_UPTIME_FEED", SEQUENCER_UPTIME_FEED);
+        bool allowMissingSequencerFeed = vm.envOr("ALLOW_MISSING_SEQUENCER_FEED", false);
+        bool allowSingleSourceOracle = vm.envOr("ALLOW_SINGLE_SOURCE_ORACLE", false);
+
+        if (sequencerUptimeFeed == address(0) && !allowMissingSequencerFeed) {
+            revert("DeployUnichain: missing SEQUENCER_UPTIME_FEED");
+        }
+        if (!allowSingleSourceOracle) {
+            _requireProductionTWAPPools();
+        }
+
+        vm.startBroadcast();
+
+        console.log("==============================================");
+        console.log("Deploying Revert infrastructure on Unichain...");
+        console.log("==============================================");
+        console.log("Deployer:", deployer);
+        console.log("0x AllowanceHolder:", zeroXAllowanceHolder);
+        console.log("Sequencer Uptime Feed:", sequencerUptimeFeed);
+        console.log("Single-source oracle allowed:", allowSingleSourceOracle);
+        console.log("");
+
+        // ==================== Step 1: Deploy Core Infrastructure ====================
+
+        console.log("Step 1: Deploying Core Infrastructure...");
+
+        InterestRateModel interestRateModel =
+            new InterestRateModel(BASE_RATE_PER_YEAR, MULTIPLIER_PER_YEAR, JUMP_MULTIPLIER_PER_YEAR, KINK);
+        console.log("  InterestRateModel deployed at:", address(interestRateModel));
+
+        // Deploy LiquidityCalculator
+        LiquidityCalculator liquidityCalculator = new LiquidityCalculator();
+        console.log("  LiquidityCalculator deployed at:", address(liquidityCalculator));
+
+        // ==================== Step 2: Deploy V4Oracle ====================
+
+        console.log("Step 2: Deploying V4Oracle...");
+
+        // Deploy V4Oracle with USDC as reference token and a non-token USD sentinel as Chainlink reference.
+        V4Oracle oracle = new V4Oracle(POSITION_MANAGER, ORACLE_REFERENCE_TOKEN, USD_REFERENCE);
+        console.log("  V4Oracle deployed at:", address(oracle));
+
+        // Configure oracle settings
+        oracle.setMaxPoolPriceDifference(MAX_POOL_PRICE_DIFFERENCE);
+        if (sequencerUptimeFeed != address(0)) {
+            oracle.setSequencerUptimeFeed(sequencerUptimeFeed);
+            console.log("  Configured sequencer uptime feed");
+        }
+
+        // Configure token feeds (RedStone feeds implement AggregatorV3Interface)
+        // USDC/USD
+        if (REDSTONE_USDC_USD != address(0) && USDC != address(0)) {
+            _configureOracleToken(
+                oracle,
+                USDC,
+                AggregatorV3Interface(REDSTONE_USDC_USD),
+                USDC_MAX_FEED_AGE,
+                address(0),
+                USDC,
+                allowSingleSourceOracle
+            );
+            console.log("  Configured USDC/USD feed");
+        }
+
+        // ETH/USD
+        if (REDSTONE_ETH_USD != address(0)) {
+            _configureOracleToken(
+                oracle,
+                WETH,
+                AggregatorV3Interface(REDSTONE_ETH_USD),
+                ETH_MAX_FEED_AGE,
+                UNISWAP_V3_WETH_USDC,
+                WETH,
+                allowSingleSourceOracle
+            );
+            _configureOracleToken(
+                oracle,
+                ETH,
+                AggregatorV3Interface(REDSTONE_ETH_USD),
+                ETH_MAX_FEED_AGE,
+                UNISWAP_V3_WETH_USDC,
+                WETH,
+                allowSingleSourceOracle
+            );
+            console.log("  Configured ETH/USD feed");
+        }
+
+        // BTC/USD
+        if (
+            REDSTONE_BTC_USD != address(0) && WBTC != address(0)
+                && (UNISWAP_V3_WBTC_USDC != address(0) || allowSingleSourceOracle)
+        ) {
+            _configureOracleToken(
+                oracle,
+                WBTC,
+                AggregatorV3Interface(REDSTONE_BTC_USD),
+                BTC_MAX_FEED_AGE,
+                UNISWAP_V3_WBTC_USDC,
+                WBTC,
+                allowSingleSourceOracle
+            );
+            console.log("  Configured BTC/USD feed");
+        } else if (WBTC != address(0)) {
+            console.log("  Skipped BTC/USD feed: missing production TWAP pool");
+        }
+
+        // USDT/USD
+        if (REDSTONE_USDT_USD != address(0) && USDT != address(0)) {
+            _configureOracleToken(
+                oracle,
+                USDT,
+                AggregatorV3Interface(REDSTONE_USDT_USD),
+                USDT_MAX_FEED_AGE,
+                UNISWAP_V3_USDT_USDC,
+                USDT,
+                allowSingleSourceOracle
+            );
+            console.log("  Configured USDT/USD feed");
+        }
+
+        // DAI/USD
+        if (REDSTONE_DAI_USD != address(0) && DAI != address(0)) {
+            _configureOracleToken(
+                oracle,
+                DAI,
+                AggregatorV3Interface(REDSTONE_DAI_USD),
+                DAI_MAX_FEED_AGE,
+                UNISWAP_V3_DAI_USDC,
+                DAI,
+                allowSingleSourceOracle
+            );
+            console.log("  Configured DAI/USD feed");
+        }
+
+        // UNI/USD
+        if (REDSTONE_UNI_USD != address(0) && UNI != address(0)) {
+            _configureOracleToken(
+                oracle,
+                UNI,
+                AggregatorV3Interface(REDSTONE_UNI_USD),
+                UNI_MAX_FEED_AGE,
+                UNISWAP_V3_UNI_USDC,
+                UNI,
+                allowSingleSourceOracle
+            );
+            console.log("  Configured UNI/USD feed");
+        }
+
+        // ==================== Step 3: Deploy RevertHook action contracts ====================
+
+        console.log("Step 3: Deploying RevertHook action contracts...");
+        uint64 hookSidecarNonce = vm.getNonce(deployer);
+        address predictedFeeController = vm.computeCreateAddress(deployer, hookSidecarNonce);
+        address predictedRouteController = vm.computeCreateAddress(deployer, hookSidecarNonce + 1);
+        address predictedSwapActions = vm.computeCreateAddress(deployer, hookSidecarNonce + 2);
+        address predictedPositionActions = vm.computeCreateAddress(deployer, hookSidecarNonce + 3);
+        address predictedAutoLeverageActions = vm.computeCreateAddress(deployer, hookSidecarNonce + 4);
+        address predictedAutoLendActions = vm.computeCreateAddress(deployer, hookSidecarNonce + 5);
+        address predictedMigrationActions = vm.computeCreateAddress(deployer, hookSidecarNonce + 6);
+        address predictedAuctionController = vm.computeCreateAddress(deployer, hookSidecarNonce + 7);
+
+        bytes memory constructorArgs = abi.encode(
+            deployer,
+            oracle,
+            HookFeeController(predictedFeeController),
+            HookAuctionController(predictedAuctionController),
+            RevertHookPositionActions(predictedPositionActions),
+            RevertHookAutoLeverageActions(predictedAutoLeverageActions),
+            RevertHookAutoLendActions(predictedAutoLendActions),
+            RevertHookMigrationActions(predictedMigrationActions)
+        );
+        bytes memory creationCodeWithArgs = abi.encodePacked(type(RevertHook).creationCode, constructorArgs);
+
+        // ==================== Step 4: Deploy RevertHook with CREATE2 ====================
+
+        console.log("Step 4: Deploying RevertHook with CREATE2 address mining...");
+
+        // Mine for a valid hook address
+        // Note: Forge uses CREATE2_DEPLOYER (0x4e59b44847b379578588920cA78FbF26c0B4956C) for CREATE2 deployments
+        console.log("  Mining for valid hook address...");
+        (address expectedHookAddress, bytes32 salt) = findHookSalt(CREATE2_DEPLOYER, creationCodeWithArgs);
+        console.log("  Found valid hook address:", expectedHookAddress);
+        console.log("  Using salt:", vm.toString(salt));
+
+        HookFeeController feeController =
+            new HookFeeController(expectedHookAddress, deployer, PROTOCOL_FEE_BPS, PROTOCOL_FEE_BPS);
+        require(address(feeController) == predictedFeeController, "Fee controller address mismatch");
+        console.log("  HookFeeController deployed at:", address(feeController));
+        HookRouteController routeController = new HookRouteController(expectedHookAddress);
+        require(address(routeController) == predictedRouteController, "Route controller address mismatch");
+        console.log("  HookRouteController deployed at:", address(routeController));
+        RevertHookSwapActions swapActions = new RevertHookSwapActions(oracle.poolManager(), feeController);
+        require(address(swapActions) == predictedSwapActions, "Swap actions address mismatch");
+        console.log("  RevertHookSwapActions deployed at:", address(swapActions));
+
+        // Deploy RevertHookPositionActions separately to avoid initcode size limit
+        RevertHookPositionActions positionActions = new RevertHookPositionActions(
+            IPermit2(PERMIT2), oracle, ILiquidityCalculator(liquidityCalculator), routeController, swapActions
+        );
+        console.log("  RevertHookPositionActions deployed at:", address(positionActions));
+
+        // Deploy RevertHookAutoLeverageActions separately to avoid initcode size limit
+        RevertHookAutoLeverageActions autoLeverageActions = new RevertHookAutoLeverageActions(
+            IPermit2(PERMIT2), oracle, ILiquidityCalculator(liquidityCalculator), routeController, swapActions
+        );
+        console.log("  RevertHookAutoLeverageActions deployed at:", address(autoLeverageActions));
+
+        RevertHookAutoLendActions autoLendActions = new RevertHookAutoLendActions(
+            IPermit2(PERMIT2),
+            oracle,
+            ILiquidityCalculator(liquidityCalculator),
+            feeController,
+            routeController,
+            swapActions
+        );
+        console.log("  RevertHookAutoLendActions deployed at:", address(autoLendActions));
+
+        // Deploy RevertHookMigrationActions (delegatecall target 4: remint migration + add-liquidity tail)
+        RevertHookMigrationActions migrationActions = new RevertHookMigrationActions(
+            IPermit2(PERMIT2), oracle, ILiquidityCalculator(liquidityCalculator), routeController, swapActions
+        );
+        require(address(migrationActions) == predictedMigrationActions, "Migration actions address mismatch");
+        console.log("  RevertHookMigrationActions deployed at:", address(migrationActions));
+
+        // Deploy RevertHook using CREATE2
+        HookAuctionController auctionController = new HookAuctionController(expectedHookAddress, oracle.poolManager());
+        require(address(auctionController) == predictedAuctionController, "Auction controller address mismatch");
+        console.log("  HookAuctionController deployed at:", address(auctionController));
+
+        RevertHook revertHook = new RevertHook{salt: salt}(
+            deployer, // owner
+            oracle,
+            feeController,
+            auctionController,
+            positionActions,
+            autoLeverageActions,
+            autoLendActions,
+            migrationActions
+        );
+        require(address(revertHook) == expectedHookAddress, "Hook address mismatch");
+        console.log("  RevertHook deployed at:", address(revertHook));
+
+        // Configure RevertHook settings
+        revertHook.setMaxTicksFromOracle(MAX_TICKS_FROM_ORACLE);
+        revertHook.setMinPositionValueNative(MIN_POSITION_VALUE_NATIVE);
+        console.log("  RevertHook configured");
+
+        // Seed the executor denylist with the canonical shared router so a bidder cannot register
+        // it as their executor and hand the discounted fee to all of the router's traffic for the
+        // epoch. Extend this with any other shared routers / aggregators used on this chain.
+        auctionController.setExecutorDenied(UNIVERSAL_ROUTER, true);
+        console.log("  Executor denylist seeded (UniversalRouter):", UNIVERSAL_ROUTER);
+
+        // ==================== Step 5: Deploy V4Vault (USDC lending) ====================
+
+        console.log("Step 5: Deploying V4Vault (USDC)...");
+
+        V4Vault vault =
+            new V4Vault("Revert Lend USDC", "rlUSDC", USDC, POSITION_MANAGER, interestRateModel, oracle, IWETH9(WETH));
+        console.log("  V4Vault deployed at:", address(vault));
+
+        vault.setTokenConfig(USDC, CF_STABLECOIN, type(uint32).max);
+        vault.setTokenConfig(WETH, CF_ETH, type(uint32).max);
+        vault.setTokenConfig(ETH, CF_ETH, type(uint32).max);
+        if (WBTC != address(0) && (UNISWAP_V3_WBTC_USDC != address(0) || allowSingleSourceOracle)) {
+            vault.setTokenConfig(WBTC, CF_BTC, type(uint32).max);
+        } else {
+            console.log("  Skipped WBTC collateral: missing production TWAP pool");
+        }
+        if (USDT != address(0)) {
+            vault.setTokenConfig(USDT, CF_STABLECOIN, type(uint32).max);
+        }
+        if (DAI != address(0)) {
+            vault.setTokenConfig(DAI, CF_STABLECOIN, type(uint32).max);
+        }
+        if (UNI != address(0)) {
+            vault.setTokenConfig(UNI, CF_OTHER, type(uint32).max);
+        }
+        console.log("  Configured collateral tokens");
+
+        vault.setLimits(
+            MIN_LOAN_SIZE,
+            GLOBAL_LEND_LIMIT,
+            GLOBAL_DEBT_LIMIT,
+            DAILY_LEND_INCREASE_LIMIT_MIN,
+            DAILY_DEBT_INCREASE_LIMIT_MIN
+        );
+        vault.setReserveFactor(uint32(Q32 * 10 / 100));
+        vault.setReserveProtectionFactor(uint32(Q32 * 5 / 100));
+        console.log("  Configured vault limits and reserve factors");
+
+        // ==================== Step 6: Deploy Transformers ====================
+
+        console.log("Step 6: Deploying transformers...");
+
+        FlashloanLiquidator flashloanLiquidator =
+            new FlashloanLiquidator(POSITION_MANAGER, UNIVERSAL_ROUTER, zeroXAllowanceHolder);
+        console.log("  FlashloanLiquidator deployed at:", address(flashloanLiquidator));
+
+        V4Utils v4Utils = new V4Utils(POSITION_MANAGER, UNIVERSAL_ROUTER, zeroXAllowanceHolder, IPermit2(PERMIT2));
+        console.log("  V4Utils deployed at:", address(v4Utils));
+
+        LeverageTransformer leverageTransformer =
+            new LeverageTransformer(POSITION_MANAGER, UNIVERSAL_ROUTER, zeroXAllowanceHolder, IPermit2(PERMIT2));
+        console.log("  LeverageTransformer deployed at:", address(leverageTransformer));
+
+        // ==================== Step 7: Configure Integrations ====================
+
+        console.log("Step 7: Configuring integrations...");
+
+        v4Utils.setVault(address(vault));
+        vault.setTransformer(address(v4Utils), true);
+        console.log("  V4Utils registered with vault");
+
+        leverageTransformer.setVault(address(vault));
+        vault.setTransformer(address(leverageTransformer), true);
+        console.log("  LeverageTransformer registered with vault");
+
+        revertHook.setVault(address(vault));
+        vault.setTransformer(address(revertHook), true);
+        console.log("  RevertHook registered as vault transformer");
+
+        oracle.setHookFeeQuoter(address(revertHook), address(feeController));
+        vault.setHookAllowList(address(revertHook), true);
+        console.log("  RevertHook added to vault hook allowlist");
+
+        revertHook.setAutoLendVault(USDC, vault);
+        console.log("  Auto-lend vault configured for USDC");
+
+        vm.stopBroadcast();
+
+        // ==================== Deployment Summary ====================
+
+        console.log("");
+        console.log("==============================================");
+        console.log("              DEPLOYMENT SUMMARY               ");
+        console.log("==============================================");
+        console.log("Network: Unichain (Chain ID: 130)");
+        console.log("----------------------------------------------");
+        console.log("Core Infrastructure:");
+        console.log("  InterestRateModel:          ", address(interestRateModel));
+        console.log("  LiquidityCalculator:        ", address(liquidityCalculator));
+        console.log("  V4Oracle:                   ", address(oracle));
+        console.log("----------------------------------------------");
+        console.log("Hook Contracts:");
+        console.log("  RevertHookPositionActions:  ", address(positionActions));
+        console.log("  RevertHookAutoLeverageActions:", address(autoLeverageActions));
+        console.log("  RevertHookAutoLendActions:  ", address(autoLendActions));
+        console.log("  RevertHook:                 ", address(revertHook));
+        console.log("----------------------------------------------");
+        console.log("Vault & Transformers:");
+        console.log("  V4Vault (rlUSDC):           ", address(vault));
+        console.log("  V4Utils:                    ", address(v4Utils));
+        console.log("  LeverageTransformer:        ", address(leverageTransformer));
+        console.log("  FlashloanLiquidator:        ", address(flashloanLiquidator));
+        console.log("==============================================");
+    }
+}

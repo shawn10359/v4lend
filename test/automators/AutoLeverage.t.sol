@@ -1,0 +1,1293 @@
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
+
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
+import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
+import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
+import {PositionInfo} from "@uniswap/v4-periphery/src/libraries/PositionInfoLibrary.sol";
+import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
+
+import {AutoLeverage} from "../../src/automators/AutoLeverage.sol";
+import {AutoLeverageLib} from "../../src/shared/planning/AutoLeverageLib.sol";
+import {Constants} from "src/shared/Constants.sol";
+import {Swapper} from "src/shared/swap/Swapper.sol";
+import {IUniversalRouter} from "src/shared/swap/IUniversalRouter.sol";
+import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
+import {AutomatorTestBase} from "./AutomatorTestBase.sol";
+
+contract AutoLeverageTest is AutomatorTestBase {
+    AutoLeverage public autoLeverage;
+
+    function setUp() public override {
+        super.setUp();
+
+        autoLeverage =
+            new AutoLeverage(positionManager, address(swapRouter), EX0x, permit2, v4Oracle, operator, protocolFeeRecipient);
+        autoLeverage.setVault(address(vault));
+        vault.setTransformer(address(autoLeverage), true);
+
+        // Increase oracle tolerance for testing
+        v4Oracle.setMaxPoolPriceDifference(10000);
+    }
+
+    function _execute(AutoLeverage.ExecuteParams memory params) internal {
+        vm.prank(operator);
+        autoLeverage.execute(params);
+        _assertNoAutomatorDust(address(autoLeverage), "AutoLeverage");
+    }
+
+    /// @dev Half of the borrow a leverage-up will take, in lend-token units: swapped into the other
+    ///      position token so a full-range position receives balanced liquidity.
+    function _leverageUpSwapAmount(uint256 tokenId, uint16 targetRatioBps) internal view returns (uint256) {
+        (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        return AutoLeverageLib.borrowAmountToTarget(debt, fullValue, collateralValue, targetRatioBps) / 2;
+    }
+
+    /// @dev Universal Router data for USDC -> native ETH: v3 exact-in to WETH held by the router,
+    ///      sweep leftover USDC back, then unwrap the WETH to the recipient.
+    function _createSwapDataToEth(uint256 amountIn, address recipient) internal view returns (bytes memory) {
+        bytes[] memory inputs = new bytes[](3);
+        inputs[0] = abi.encode(
+            address(2), amountIn, uint256(0), abi.encodePacked(address(usdc), uint24(500), address(weth)), false
+        );
+        inputs[1] = abi.encode(address(usdc), recipient, uint256(0));
+        inputs[2] = abi.encode(recipient, uint256(0));
+        return abi.encode(
+            address(swapRouter), abi.encode(Swapper.UniversalRouterData(hex"00040c", inputs, block.timestamp))
+        );
+    }
+
+    function _wethToUsdcAmountForDeleverage(uint256 tokenId, PoolKey memory poolKey, uint16 targetRatioBps)
+        internal
+        view
+        returns (uint256 amount1)
+    {
+        (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        uint256 repayAmount = AutoLeverageLib.repayAmountToTarget(debt, fullValue, collateralValue, targetRatioBps);
+        uint128 currentLiquidity = positionManager.getPositionLiquidity(tokenId);
+        (uint256 positionValue,,,) = v4Oracle.getValue(tokenId, address(usdc));
+        uint128 liquidityToRemove = AutoLeverageLib.liquidityToRemove(currentLiquidity, repayAmount, positionValue);
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(poolManager, PoolIdLibrary.toId(poolKey));
+        (, amount1) = LiquidityAmounts.getAmountsForLiquidity(
+            sqrtPriceX96, TickMath.getSqrtPriceAtTick(-887220), TickMath.getSqrtPriceAtTick(887220), liquidityToRemove
+        );
+    }
+
+    /// @dev Token amounts a planner-sized deleverage removal will return for a full-range position.
+    function _removedAmountsForDeleverage(uint256 tokenId, PoolKey memory poolKey, uint16 targetRatioBps)
+        internal
+        view
+        returns (uint256 amount0, uint256 amount1)
+    {
+        (uint256 debt, uint256 fullValue, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        uint256 repayAmount = AutoLeverageLib.repayAmountToTarget(debt, fullValue, collateralValue, targetRatioBps);
+        uint128 currentLiquidity = positionManager.getPositionLiquidity(tokenId);
+        (uint256 positionValue,,,) = v4Oracle.getValue(tokenId, address(usdc));
+        uint128 liquidityToRemove = AutoLeverageLib.liquidityToRemove(currentLiquidity, repayAmount, positionValue);
+        (uint160 sqrtPriceX96,,,) = StateLibrary.getSlot0(poolManager, PoolIdLibrary.toId(poolKey));
+        (amount0, amount1) = LiquidityAmounts.getAmountsForLiquidity(
+            sqrtPriceX96, TickMath.getSqrtPriceAtTick(-887220), TickMath.getSqrtPriceAtTick(887220), liquidityToRemove
+        );
+    }
+
+    /// @dev Universal Router data that swaps `amountIn` through a V3 pool but delivers only `keepBps` of it to
+    ///      `recipient`; the rest of the output goes to `diversion`. Models an operator that routes part of
+    ///      the swap output away from the automator while the swap itself still succeeds.
+    function _createSplitSwapData(
+        uint256 amountIn,
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        uint16 keepBps,
+        address recipient,
+        address diversion
+    ) internal view returns (bytes memory swapData) {
+        uint256 keptIn = amountIn * keepBps / 10000;
+        bytes memory path = abi.encodePacked(tokenIn, fee, tokenOut);
+        bytes[] memory inputs = new bytes[](3);
+        inputs[0] = abi.encode(recipient, keptIn, uint256(0), path, false);
+        inputs[1] = abi.encode(diversion, amountIn - keptIn, uint256(0), path, false);
+        inputs[2] = abi.encode(tokenIn, recipient, 0);
+        swapData = abi.encode(
+            address(swapRouter), abi.encode(Swapper.UniversalRouterData(hex"000004", inputs, block.timestamp))
+        );
+    }
+
+    /// @dev USDC vault over a DAI/WETH position (lend token is neither pool token), levered to 70% with a
+    ///      30% target so a deleverage has to remove liquidity and swap both tokens into USDC.
+    function _setupThirdTokenDeleverage(uint16 maxSwapSlippageBps)
+        internal
+        returns (PoolKey memory poolKey, uint256 tokenId)
+    {
+        vault.setTokenConfig(address(dai), uint32(Q32 * 9 / 10), type(uint32).max);
+        poolKey = _createDaiWethPool();
+        v4Oracle.setMaxPoolPriceDifference(type(uint16).max);
+        _createFullRangePositionDaiWeth(poolKey);
+        _approveWhaleDaiAndWeth();
+        tokenId = _mintPosition(poolKey, -887220, 887220, 1e19);
+
+        _depositToVault(50000000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, collateralValue * 70 / 100);
+
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 3000,
+            rebalanceThresholdBps: 100,
+            maxSwapSlippageBps: maxSwapSlippageBps,
+            maxRewardX64: 0
+        });
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+    }
+
+    function _thirdTokenDeleverageParams(uint256 tokenId, uint256 amountIn0, uint256 amountIn1)
+        internal
+        view
+        returns (AutoLeverage.ExecuteParams memory params)
+    {
+        params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: false,
+            amountIn0: amountIn0,
+            amountOut0Min: 0,
+            swapData0: _createSwapDataWithFee(amountIn0, 0, address(dai), address(usdc), 500, address(autoLeverage)),
+            amountIn1: amountIn1,
+            amountOut1Min: 0,
+            swapData1: _createSwapDataWithFee(amountIn1, 0, address(weth), address(usdc), 500, address(autoLeverage)),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+    }
+
+    // --- Access Control ---
+
+    function test_RevertWhenNonOperatorCallsExecute() public {
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: 1,
+            vault: address(vault),
+            leverageUp: true,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: 0,
+            amountOut1Min: 0,
+            swapData1: bytes(""),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        address randomUser = makeAddr("random");
+        vm.prank(randomUser);
+        vm.expectRevert(Constants.Unauthorized.selector);
+        autoLeverage.execute(params);
+    }
+
+    function test_RevertWhenInvalidVault() public {
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: 1,
+            vault: makeAddr("fakeVault"),
+            leverageUp: true,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: 0,
+            amountOut1Min: 0,
+            swapData1: bytes(""),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        vm.prank(operator);
+        vm.expectRevert(Constants.Unauthorized.selector);
+        autoLeverage.execute(params);
+    }
+
+    // --- Config Tests ---
+
+    function test_ConfigToken() public {
+        PoolKey memory poolKey = _createPool();
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        // Must be vault-owned
+        _depositToVault(200000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 5000,
+            rebalanceThresholdBps: 500,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+
+        (bool isActive, uint16 targetBps, uint16 threshold,,) =
+            autoLeverage.positionConfigs(tokenId);
+        assertTrue(isActive);
+        assertEq(targetBps, 5000);
+        assertEq(threshold, 500);
+    }
+
+    function test_RevertWhenNonVaultOwnedPositionConfigured() public {
+        PoolKey memory poolKey = _createPool();
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        // Position is NOT in vault
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 5000,
+            rebalanceThresholdBps: 500,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        vm.expectRevert(Constants.Unauthorized.selector);
+        autoLeverage.configToken(tokenId, config);
+    }
+
+    function test_RevertWhenTargetTooHigh() public {
+        PoolKey memory poolKey = _createPool();
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        _depositToVault(200000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 10000, // 100% - invalid
+            rebalanceThresholdBps: 500,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        vm.expectRevert(Constants.InvalidConfig.selector);
+        autoLeverage.configToken(tokenId, config);
+    }
+
+    function test_RevertWhenThresholdZero() public {
+        PoolKey memory poolKey = _createPool();
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        _depositToVault(200000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 5000,
+            rebalanceThresholdBps: 0, // Zero threshold - invalid
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        vm.expectRevert(Constants.InvalidConfig.selector);
+        autoLeverage.configToken(tokenId, config);
+    }
+
+    // --- Execute Tests ---
+
+    function test_LeverageUp() public {
+        PoolKey memory poolKey = _createPool();
+        // Create liquidity position for swaps
+        _createFullRangePosition(poolKey);
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        // Setup vault position
+        _depositToVault(50000000000, WHALE_ACCOUNT); // 50k USDC
+        _addPositionToVault(tokenId);
+
+        // Borrow small amount (10% of collateral)
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        uint256 borrowAmount = collateralValue * 10 / 100;
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, borrowAmount);
+
+        // Configure for 50% target leverage
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 5000,
+            rebalanceThresholdBps: 500, // 5% band: also the accepted overshoot above target
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+
+        // Approve transform
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        // Record debt before
+        (uint256 debtBefore,,,,) = vault.loanInfo(tokenId);
+
+        // Execute leverage up
+        // half of the borrow is swapped into the other position token so the leverage-up actually
+        // adds balanced liquidity; without a swap the borrow would just increase debt and the
+        // post-condition rejects the overshoot
+        uint256 swapIn = _leverageUpSwapAmount(tokenId, 5000);
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: true,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: swapIn,
+            amountOut1Min: 0,
+            swapData1: _createSwapDataWithFee(swapIn, 0, address(usdc), address(weth), 500, address(autoLeverage)),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        _execute(params);
+
+        // Debt should have increased
+        (uint256 debtAfter,, uint256 collateralAfter,,) = vault.loanInfo(tokenId);
+        assertGt(debtAfter, debtBefore, "Debt should increase after leverage up");
+        uint256 ratioAfter = debtAfter * 10_000 / collateralAfter;
+        assertLe(ratioAfter, 5_500, "leverage-up must not overshoot the target by more than the band");
+        assertGt(ratioAfter, 4_000, "leverage-up should land near the target");
+
+        // Position should still be owned by vault
+        assertEq(IERC721(address(positionManager)).ownerOf(tokenId), address(vault));
+    }
+
+    function test_LeverageDown() public {
+        PoolKey memory poolKey = _createPool();
+        _createFullRangePosition(poolKey);
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        // Setup vault position with high leverage
+        _depositToVault(50000000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        // Borrow 70% of collateral
+        uint256 borrowAmount = collateralValue * 70 / 100;
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, borrowAmount);
+
+        // Configure for 30% target (current is ~70%, want to go down)
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 3000,
+            rebalanceThresholdBps: 100,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        (uint256 debtBefore,,,,) = vault.loanInfo(tokenId);
+        uint256 amountIn1 = _wethToUsdcAmountForDeleverage(tokenId, poolKey, 3000);
+
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: false,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: amountIn1,
+            amountOut1Min: 0,
+            swapData1: _createSwapDataWithFee(amountIn1, 0, address(weth), address(usdc), 500, address(autoLeverage)),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        _execute(params);
+
+        (uint256 debtAfter,, uint256 collateralAfter,,) = vault.loanInfo(tokenId);
+        assertLt(debtAfter, debtBefore, "Debt should decrease after leverage down");
+        assertApproxEqAbs(
+            debtAfter * 10000 / collateralAfter,
+            3000,
+            25,
+            "deleverage should land near target without excess liquidity removal"
+        );
+    }
+
+    function test_LeverageDownSweepsDustedBalances() public {
+        PoolKey memory poolKey = _createPool();
+        _createFullRangePosition(poolKey);
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        _depositToVault(50000000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, collateralValue * 70 / 100);
+
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 3000,
+            rebalanceThresholdBps: 100,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        uint256 dustAmount = 111;
+        deal(address(weth), address(autoLeverage), dustAmount);
+        uint256 ownerWethBefore = weth.balanceOf(WHALE_ACCOUNT);
+        uint256 amountIn1 = _wethToUsdcAmountForDeleverage(tokenId, poolKey, 3000);
+
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: false,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: amountIn1,
+            amountOut1Min: 0,
+            swapData1: _createSwapDataWithFee(amountIn1, 0, address(weth), address(usdc), 500, address(autoLeverage)),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        _execute(params);
+
+        assertEq(weth.balanceOf(address(autoLeverage)), 0, "dusted WETH should be swept out by leverage down");
+        assertGe(weth.balanceOf(WHALE_ACCOUNT) - ownerWethBefore, dustAmount, "owner should receive the dusted WETH");
+    }
+
+    function test_LeverageDownThirdTokenFeesReduceLiquidityRemoval() public {
+        // Enable DAI collateral for this vault-backed scenario.
+        vault.setTokenConfig(address(dai), uint32(Q32 * 9 / 10), type(uint32).max);
+
+        PoolKey memory poolKey = _createDaiWethPool();
+        _createFullRangePositionDaiWeth(poolKey);
+        uint256 tokenId = _createFullRangePositionDaiWeth(poolKey);
+        v4Oracle.setMaxPoolPriceDifference(type(uint16).max);
+
+        _generateFeesDaiWeth(poolKey);
+        (, uint128 fee0, uint128 fee1) = v4Oracle.getLiquidityAndFees(tokenId);
+
+        _depositToVault(50000000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        uint16 maxSwapSlippageBps = 100;
+        uint256 conservativeFeeRepayCapacity =
+            _quoteTokenToUsdcWithHaircut(address(dai), fee0, maxSwapSlippageBps)
+            + _quoteTokenToUsdcWithHaircut(address(weth), fee1, maxSwapSlippageBps);
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        uint256 repayAmountTarget = conservativeFeeRepayCapacity * 9 / 10;
+        uint256 borrowAmount = (3000 * collateralValue + repayAmountTarget * (10000 - 3000)) / 10000;
+
+        assertGt(fee0, 0, "expected DAI fees");
+        assertGt(fee1, 0, "expected WETH fees");
+        assertGt(conservativeFeeRepayCapacity, repayAmountTarget, "fees should cover deleverage target");
+        assertGt(borrowAmount, conservativeFeeRepayCapacity, "position should remain leveraged after fee-only deleverage");
+
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, borrowAmount);
+
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 3000,
+            rebalanceThresholdBps: 100,
+            maxSwapSlippageBps: maxSwapSlippageBps,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        uint128 liquidityBefore = positionManager.getPositionLiquidity(tokenId);
+        (uint256 debtBefore,,,,) = vault.loanInfo(tokenId);
+
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: false,
+            amountIn0: fee0,
+            amountOut0Min: 0,
+            swapData0: _createSwapDataWithFee(fee0, 0, address(dai), address(usdc), 500, address(autoLeverage)),
+            amountIn1: fee1,
+            amountOut1Min: 0,
+            swapData1: _createSwapDataWithFee(fee1, 0, address(weth), address(usdc), 500, address(autoLeverage)),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        _execute(params);
+
+        uint128 liquidityAfter = positionManager.getPositionLiquidity(tokenId);
+        (uint256 debtAfter, uint256 debtSharesAfter, uint256 collateralAfter,,) = vault.loanInfo(tokenId);
+
+        assertEq(liquidityAfter, liquidityBefore, "fees alone should avoid liquidity removal");
+        assertLt(debtAfter, debtBefore, "fees should still repay debt");
+        assertEq(usdc.balanceOf(address(autoLeverage)), 0, "automator should not retain lend token leftovers");
+        assertGt(debtSharesAfter, 0, "position should remain leveraged after fee-only deleverage");
+        assertGt(collateralAfter, 0, "position should remain open after fee-only deleverage");
+    }
+
+    /// @notice Positive control for the band postcondition: an honest third-token deleverage that swaps
+    ///         everything it removed lands on target and passes.
+    function test_LeverageDownThirdTokenLandsOnTarget() public {
+        (PoolKey memory poolKey, uint256 tokenId) = _setupThirdTokenDeleverage(10000);
+        (uint256 amountIn0, uint256 amountIn1) = _removedAmountsForDeleverage(tokenId, poolKey, 3000);
+        assertGt(amountIn0, 0, "deleverage should remove DAI");
+        assertGt(amountIn1, 0, "deleverage should remove WETH");
+
+        uint128 liquidityBefore = positionManager.getPositionLiquidity(tokenId);
+        (uint256 debtBefore,,,,) = vault.loanInfo(tokenId);
+
+        _execute(_thirdTokenDeleverageParams(tokenId, amountIn0, amountIn1));
+
+        (uint256 debtAfter,, uint256 collateralAfter,,) = vault.loanInfo(tokenId);
+        assertLt(positionManager.getPositionLiquidity(tokenId), liquidityBefore, "liquidity should be removed");
+        assertLt(debtAfter, debtBefore, "debt should decrease");
+        assertApproxEqAbs(debtAfter * 10000 / collateralAfter, 3000, 100, "honest deleverage lands inside the band");
+    }
+
+    /// @notice Audit PoC: with `maxSwapSlippageBps == 10000` the operator routes 25% of each third-token swap
+    ///         output away from the automator. Liquidity sized for the full repayment is removed, the ratio
+    ///         still drops, but the position stays far above target. The band postcondition must reject it.
+    function test_RevertWhenLeverageDownDivertsPartOfSwapOutput() public {
+        (PoolKey memory poolKey, uint256 tokenId) = _setupThirdTokenDeleverage(10000);
+        (uint256 amountIn0, uint256 amountIn1) = _removedAmountsForDeleverage(tokenId, poolKey, 3000);
+        address diversion = makeAddr("diversion");
+
+        AutoLeverage.ExecuteParams memory params = _thirdTokenDeleverageParams(tokenId, amountIn0, amountIn1);
+        params.swapData0 =
+            _createSplitSwapData(amountIn0, address(dai), address(usdc), 500, 7500, address(autoLeverage), diversion);
+        params.swapData1 =
+            _createSplitSwapData(amountIn1, address(weth), address(usdc), 500, 7500, address(autoLeverage), diversion);
+
+        uint128 liquidityBefore = positionManager.getPositionLiquidity(tokenId);
+        (uint256 debtBefore,,,,) = vault.loanInfo(tokenId);
+
+        vm.prank(operator);
+        vm.expectRevert(Constants.TransformFailed.selector);
+        autoLeverage.execute(params);
+
+        (uint256 debtAfter,,,,) = vault.loanInfo(tokenId);
+        assertEq(debtAfter, debtBefore, "rejected deleverage must leave debt unchanged");
+        assertEq(positionManager.getPositionLiquidity(tokenId), liquidityBefore, "rejected deleverage keeps liquidity");
+        assertEq(usdc.balanceOf(diversion), 0, "no swap output may reach the diversion address");
+    }
+
+    /// @notice Same shape in the bounded-slippage mode: the oracle floor already forces each swap's output to
+    ///         reach the automator, so the operator instead swaps only three quarters of what was removed. The
+    ///         ratio still drops (it would rise if less than the debt share of the removal were repaid), the
+    ///         rest would be swept to the owner as raw tokens, and the position stays far above target.
+    function test_RevertWhenLeverageDownSwapsOnlyPartOfRemovedTokens() public {
+        (PoolKey memory poolKey, uint256 tokenId) = _setupThirdTokenDeleverage(100);
+        (uint256 amountIn0, uint256 amountIn1) = _removedAmountsForDeleverage(tokenId, poolKey, 3000);
+
+        AutoLeverage.ExecuteParams memory params =
+            _thirdTokenDeleverageParams(tokenId, amountIn0 * 3 / 4, amountIn1 * 3 / 4);
+
+        (uint256 debtBefore,,,,) = vault.loanInfo(tokenId);
+        uint256 ownerDaiBefore = dai.balanceOf(WHALE_ACCOUNT);
+
+        vm.prank(operator);
+        vm.expectRevert(Constants.TransformFailed.selector);
+        autoLeverage.execute(params);
+
+        (uint256 debtAfter,,,,) = vault.loanInfo(tokenId);
+        assertEq(debtAfter, debtBefore, "rejected deleverage must leave debt unchanged");
+        assertEq(dai.balanceOf(WHALE_ACCOUNT), ownerDaiBefore, "no removed tokens may leak to the owner");
+    }
+
+    // --- Native ETH Position Tests ---
+
+    function test_LeverageUpETH() public {
+        PoolKey memory poolKey = _createEthPool();
+        _createFullRangePositionEth(poolKey);
+        uint256 tokenId = _createFullRangePositionEth(poolKey);
+
+        // Setup vault position
+        _depositToVault(50000000000, WHALE_ACCOUNT); // 50k USDC
+        _addPositionToVault(tokenId);
+
+        // Borrow small amount (10% of collateral)
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        uint256 borrowAmount = collateralValue * 10 / 100;
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, borrowAmount);
+
+        // Configure for 50% target leverage
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 5000,
+            rebalanceThresholdBps: 500,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        (uint256 debtBefore,,,,) = vault.loanInfo(tokenId);
+
+        // half of the borrow is swapped into the other position token so the leverage-up actually
+        // adds balanced liquidity; without a swap the borrow would just increase debt and the
+        // post-condition rejects the overshoot
+        uint256 swapIn = _leverageUpSwapAmount(tokenId, 5000);
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: true,
+            amountIn0: swapIn,
+            amountOut0Min: 0,
+            swapData0: _createSwapDataToEth(swapIn, address(autoLeverage)),
+            amountIn1: 0,
+            amountOut1Min: 0,
+            swapData1: bytes(""),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        _execute(params);
+
+        (uint256 debtAfter,,,,) = vault.loanInfo(tokenId);
+        assertGt(debtAfter, debtBefore, "Debt should increase after ETH leverage up");
+        assertEq(IERC721(address(positionManager)).ownerOf(tokenId), address(vault));
+    }
+
+    function test_RevertWhenLeverageDownETHOmitsRequiredSwap() public {
+        PoolKey memory poolKey = _createEthPool();
+        _createFullRangePositionEth(poolKey);
+        uint256 tokenId = _createFullRangePositionEth(poolKey);
+
+        // Setup vault position with high leverage
+        _depositToVault(50000000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        uint256 borrowAmount = collateralValue * 70 / 100;
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, borrowAmount);
+
+        // Configure for 30% target
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 3000,
+            rebalanceThresholdBps: 100,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        (uint256 debtBefore,,,,) = vault.loanInfo(tokenId);
+
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: false,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: 0,
+            amountOut1Min: 0,
+            swapData1: bytes(""),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        vm.prank(operator);
+        vm.expectRevert(Constants.TransformFailed.selector);
+        autoLeverage.execute(params);
+
+        (uint256 debtAfter,,,,) = vault.loanInfo(tokenId);
+        assertEq(debtAfter, debtBefore, "failed deleverage must leave debt unchanged");
+    }
+
+    function test_RewardSentToProtocolFeeRecipientInETH() public {
+        PoolKey memory poolKey = _createEthPool();
+        _createFullRangePositionEth(poolKey);
+        uint256 tokenId = _createFullRangePositionEth(poolKey);
+
+        _depositToVault(50000000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        uint256 borrowAmount = collateralValue * 10 / 100;
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, borrowAmount);
+
+        _generateFeesEth(poolKey);
+
+        uint64 maxReward = uint64(Q64 * 50 / 100);
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 5000,
+            rebalanceThresholdBps: 500,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: maxReward
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        uint256 recipientEthBefore = protocolFeeRecipient.balance;
+
+        // half of the borrow is swapped into the other position token so the leverage-up actually
+        // adds balanced liquidity; without a swap the borrow would just increase debt and the
+        // post-condition rejects the overshoot
+        uint256 swapIn = _leverageUpSwapAmount(tokenId, 5000);
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: true,
+            amountIn0: swapIn,
+            amountOut0Min: 0,
+            swapData0: _createSwapDataToEth(swapIn, address(autoLeverage)),
+            amountIn1: 0,
+            amountOut1Min: 0,
+            swapData1: bytes(""),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: maxReward
+        });
+
+        _execute(params);
+
+        assertEq(address(autoLeverage).balance, 0, "contract should not retain native protocol fees");
+        assertEq(usdc.balanceOf(address(autoLeverage)), 0, "contract should not retain USDC protocol fees");
+        assertGt(protocolFeeRecipient.balance, recipientEthBefore, "recipient should receive native ETH protocol fees");
+    }
+
+    // --- Revert Tests ---
+
+    function test_RevertWhenNotReady() public {
+        PoolKey memory poolKey = _createPool();
+        _createFullRangePosition(poolKey);
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        _depositToVault(50000000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        // Borrow exactly at target (50%)
+        uint256 borrowAmount = collateralValue * 50 / 100;
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, borrowAmount);
+
+        // Configure for 50% target with 10% threshold = range [40%, 60%]
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 5000,
+            rebalanceThresholdBps: 1000, // 10% threshold
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        // Current ratio is ~50%, which is within [40%, 60%]
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: true,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: 0,
+            amountOut1Min: 0,
+            swapData1: bytes(""),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        vm.prank(operator);
+        // Inner NotReady() gets wrapped by vault.transform() as TransformFailed()
+        vm.expectRevert(Constants.TransformFailed.selector);
+        autoLeverage.execute(params);
+    }
+
+    function test_ExecuteAtExactLowerThresholdBoundary() public {
+        PoolKey memory poolKey = _createPool();
+        _createFullRangePosition(poolKey);
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        _depositToVault(50000000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, collateralValue * 40 / 100);
+
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 5000,
+            rebalanceThresholdBps: 1000,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        (uint256 debtBefore,,,,) = vault.loanInfo(tokenId);
+
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: true,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: 0,
+            amountOut1Min: 0,
+            swapData1: bytes(""),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        _execute(params);
+
+        (uint256 debtAfter,,,,) = vault.loanInfo(tokenId);
+        assertGt(debtAfter, debtBefore, "exact lower threshold boundary should still rebalance up");
+    }
+
+    function test_ExecuteAtExactUpperThresholdBoundary() public {
+        PoolKey memory poolKey = _createPool();
+        _createFullRangePosition(poolKey);
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        _depositToVault(50000000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, collateralValue * 70 / 100);
+
+        (uint256 currentDebt,, uint256 currentCollateralValue,,) = vault.loanInfo(tokenId);
+        uint16 thresholdBps = uint16(currentDebt * 10_000 / currentCollateralValue / 2);
+        uint16 targetBps = uint16(currentDebt * 10_000 / currentCollateralValue) - thresholdBps;
+
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: targetBps,
+            rebalanceThresholdBps: thresholdBps,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        (uint256 debtBefore,,,,) = vault.loanInfo(tokenId);
+        uint256 amountIn1 = _wethToUsdcAmountForDeleverage(tokenId, poolKey, targetBps);
+
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: false,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: amountIn1,
+            amountOut1Min: 0,
+            swapData1: _createSwapDataWithFee(amountIn1, 0, address(weth), address(usdc), 500, address(autoLeverage)),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        _execute(params);
+
+        (uint256 debtAfter,,,,) = vault.loanInfo(tokenId);
+        assertLt(debtAfter, debtBefore, "exact upper threshold boundary should still rebalance down");
+    }
+
+    // --- Reward Retention Test ---
+
+    function test_RewardSentToProtocolFeeRecipient() public {
+        PoolKey memory poolKey = _createPool();
+        _createFullRangePosition(poolKey);
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        // Setup a low-leverage vault position so reward handling is exercised
+        // on a complete leverage-up route without requiring off-chain swap data.
+        _depositToVault(50000000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        (,, uint256 collateralValue,,) = vault.loanInfo(tokenId);
+        uint256 borrowAmount = collateralValue * 10 / 100;
+        vm.prank(WHALE_ACCOUNT);
+        vault.borrow(tokenId, borrowAmount);
+
+        // Generate fees with moderate swaps (avoid large price impact)
+        _swapExactInputSingle(poolKey, true, 100e6, 0);
+        _swapExactInputSingle(poolKey, false, 0.1e18, 0);
+        _swapExactInputSingle(poolKey, true, 100e6, 0);
+        _swapExactInputSingle(poolKey, false, 0.1e18, 0);
+
+        // Configure for 50% target (current ~10% → need leverage up) with 50% reward
+        uint64 maxReward = uint64(Q64 * 50 / 100);
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 5000,
+            rebalanceThresholdBps: 500,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: maxReward
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+        vm.prank(WHALE_ACCOUNT);
+        vault.approveTransform(tokenId, address(autoLeverage), true);
+
+        // Check contract balances before
+        uint256 recipientUsdcBefore = usdc.balanceOf(protocolFeeRecipient);
+        uint256 recipientWethBefore = weth.balanceOf(protocolFeeRecipient);
+
+        // half of the borrow is swapped into the other position token so the leverage-up actually
+        // adds balanced liquidity; without a swap the borrow would just increase debt and the
+        // post-condition rejects the overshoot
+        uint256 swapIn = _leverageUpSwapAmount(tokenId, 5000);
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: true,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: swapIn,
+            amountOut1Min: 0,
+            swapData1: _createSwapDataWithFee(swapIn, 0, address(usdc), address(weth), 500, address(autoLeverage)),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: maxReward
+        });
+
+        vm.prank(operator);
+        autoLeverage.execute(params);
+
+        uint256 contractUsdcAfter = usdc.balanceOf(address(autoLeverage));
+        uint256 contractWethAfter = weth.balanceOf(address(autoLeverage));
+        assertTrue(
+            usdc.balanceOf(protocolFeeRecipient) > recipientUsdcBefore
+                || weth.balanceOf(protocolFeeRecipient) > recipientWethBefore,
+            "recipient should receive protocol fees"
+        );
+        assertEq(contractUsdcAfter, 0, "contract should not retain USDC protocol fees");
+        assertEq(contractWethAfter, 0, "contract should not retain WETH protocol fees");
+    }
+
+    // --- Deactivation Test ---
+
+    function test_DeactivateConfig() public {
+        PoolKey memory poolKey = _createPool();
+        uint256 tokenId = _createFullRangePosition(poolKey);
+
+        _depositToVault(200000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        // Activate
+        AutoLeverage.PositionConfig memory config = AutoLeverage.PositionConfig({
+            isActive: true,
+            targetLeverageBps: 5000,
+            rebalanceThresholdBps: 500,
+            maxSwapSlippageBps: 10000,
+            maxRewardX64: 0
+        });
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+
+        (bool isActiveBefore,,,,) = autoLeverage.positionConfigs(tokenId);
+        assertTrue(isActiveBefore);
+
+        // Deactivate
+        config.isActive = false;
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(tokenId, config);
+
+        (bool isActiveAfter,,,,) = autoLeverage.positionConfigs(tokenId);
+        assertFalse(isActiveAfter);
+    }
+
+    function _createDaiWethPool() internal returns (PoolKey memory poolKey) {
+        poolKey = PoolKey({
+            currency0: Currency.wrap(address(dai)),
+            currency1: Currency.wrap(address(weth)),
+            fee: 7778,
+            tickSpacing: 60,
+            hooks: IHooks(address(0))
+        });
+
+        poolManager.initialize(poolKey, v4Oracle.getPoolSqrtPriceX96(address(dai), address(weth)));
+    }
+
+    function _approveWhaleDaiAndWeth() internal {
+        deal(address(dai), WHALE_ACCOUNT, 1_000_000e18);
+        deal(address(weth), WHALE_ACCOUNT, 1_000e18);
+
+        vm.prank(WHALE_ACCOUNT);
+        dai.approve(address(permit2), type(uint256).max);
+        vm.prank(WHALE_ACCOUNT);
+        weth.approve(address(permit2), type(uint256).max);
+        vm.prank(WHALE_ACCOUNT);
+        permit2.approve(address(dai), address(positionManager), type(uint160).max, type(uint48).max);
+        vm.prank(WHALE_ACCOUNT);
+        permit2.approve(address(weth), address(positionManager), type(uint160).max, type(uint48).max);
+    }
+
+    function _createFullRangePositionDaiWeth(PoolKey memory poolKey) internal returns (uint256 tokenId) {
+        _approveWhaleDaiAndWeth();
+        tokenId = _mintPosition(poolKey, -887220, 887220, 1e16);
+    }
+
+    function _swapExactInputSingleDaiWeth(PoolKey memory key, bool zeroForOne, uint128 amountIn, uint128 minAmountOut) internal {
+        _approveWhaleDaiAndWeth();
+        vm.prank(WHALE_ACCOUNT);
+        permit2.approve(address(dai), address(swapRouter), type(uint160).max, type(uint48).max);
+        vm.prank(WHALE_ACCOUNT);
+        permit2.approve(address(weth), address(swapRouter), type(uint160).max, type(uint48).max);
+
+        bytes memory commands = hex"10";
+        bytes[] memory inputs = new bytes[](1);
+        bytes memory actions = abi.encodePacked(uint8(Actions.SWAP_EXACT_IN_SINGLE), uint8(Actions.SETTLE_ALL), uint8(Actions.TAKE_ALL));
+        bytes[] memory params = new bytes[](3);
+        params[0] = abi.encode(
+            IV4Router.ExactInputSingleParams({
+                poolKey: key,
+                zeroForOne: zeroForOne,
+                amountIn: amountIn,
+                amountOutMinimum: minAmountOut,
+                hookData: bytes("")
+            })
+        );
+        params[1] = abi.encode(zeroForOne ? key.currency0 : key.currency1, amountIn);
+        params[2] = abi.encode(zeroForOne ? key.currency1 : key.currency0, minAmountOut);
+        inputs[0] = abi.encode(actions, params);
+
+        vm.prank(WHALE_ACCOUNT);
+        IUniversalRouter(address(swapRouter)).execute(commands, inputs, block.timestamp);
+    }
+
+    function _generateFeesDaiWeth(PoolKey memory poolKey) internal {
+        _swapExactInputSingleDaiWeth(poolKey, true, 200e18, 0);
+        _swapExactInputSingleDaiWeth(poolKey, false, 5e16, 0);
+        _swapExactInputSingleDaiWeth(poolKey, true, 200e18, 0);
+        _swapExactInputSingleDaiWeth(poolKey, false, 5e16, 0);
+    }
+
+    function _createSwapDataWithFee(
+        uint256 amountIn,
+        uint256 amountOutMin,
+        address tokenIn,
+        address tokenOut,
+        uint24 fee,
+        address recipient
+    ) internal view returns (bytes memory swapData) {
+        bytes[] memory inputs = new bytes[](2);
+        inputs[0] = abi.encode(recipient, amountIn, amountOutMin, abi.encodePacked(tokenIn, fee, tokenOut), false);
+        inputs[1] = abi.encode(tokenIn, recipient, 0);
+        swapData = abi.encode(
+            address(swapRouter), abi.encode(Swapper.UniversalRouterData(hex"0004", inputs, block.timestamp))
+        );
+    }
+
+    function _quoteTokenToUsdcWithHaircut(address tokenIn, uint256 amountIn, uint16 maxSwapSlippageBps)
+        internal
+        view
+        returns (uint256 amountOut)
+    {
+        if (amountIn == 0) {
+            return 0;
+        }
+        if (tokenIn == address(usdc)) {
+            return amountIn;
+        }
+
+        uint160 oracleSqrtPriceX96 = v4Oracle.getPoolSqrtPriceX96(tokenIn, address(usdc));
+        uint256 oraclePriceX96 = FullMath.mulDiv(uint256(oracleSqrtPriceX96), uint256(oracleSqrtPriceX96), Q96);
+        uint256 oracleOut = FullMath.mulDiv(amountIn, oraclePriceX96, Q96);
+        amountOut = FullMath.mulDiv(oracleOut, 10000 - uint256(maxSwapSlippageBps), 10000);
+    }
+
+    /// @dev L-03: configs persist after a position leaves the vault. The NFT owner must not be able to
+    ///      call `_execute` directly and have themselves treated as the `IVault`.
+    function test_RevertWhenNonVaultCallerInvokesInternalExecute() public {
+        PoolKey memory poolKey = _createPool();
+        uint256 tokenId = _createFullRangePosition(poolKey);
+        _depositToVault(200000000, WHALE_ACCOUNT);
+        _addPositionToVault(tokenId);
+
+        vm.prank(WHALE_ACCOUNT);
+        autoLeverage.configToken(
+            tokenId,
+            AutoLeverage.PositionConfig({
+                isActive: true,
+                targetLeverageBps: 5000,
+                rebalanceThresholdBps: 500,
+                maxSwapSlippageBps: 10000,
+                maxRewardX64: 0
+            })
+        );
+
+        // Position leaves the vault (no debt) to a plain EOA; the active config stays behind.
+        // (WHALE_ACCOUNT is a contract without onERC721Received, so it cannot be the safeTransfer recipient.)
+        address holder = makeAddr("holder");
+        vm.prank(WHALE_ACCOUNT);
+        vault.remove(tokenId, holder, bytes(""));
+        assertEq(IERC721(address(positionManager)).ownerOf(tokenId), holder);
+        (bool isActive,,,,) = autoLeverage.positionConfigs(tokenId);
+        assertTrue(isActive, "config persists after leaving the vault");
+
+        AutoLeverage.ExecuteParams memory params = AutoLeverage.ExecuteParams({
+            tokenId: tokenId,
+            vault: address(vault),
+            leverageUp: true,
+            amountIn0: 0,
+            amountOut0Min: 0,
+            swapData0: bytes(""),
+            amountIn1: 0,
+            amountOut1Min: 0,
+            swapData1: bytes(""),
+            amountAddMin0: 0,
+            amountAddMin1: 0,
+            amountRemoveMin0: 0,
+            amountRemoveMin1: 0,
+            deadline: block.timestamp,
+            decreaseLiquidityHookData: bytes(""),
+            increaseLiquidityHookData: bytes(""),
+            rewardX64: 0
+        });
+
+        // NFT owner calling the transform entry point directly is rejected before it is treated as a vault
+        vm.prank(holder);
+        vm.expectRevert(Constants.Unauthorized.selector);
+        autoLeverage._execute(params);
+
+        // and so is any other non-vault caller
+        vm.prank(operator);
+        vm.expectRevert(Constants.Unauthorized.selector);
+        autoLeverage._execute(params);
+    }
+}
